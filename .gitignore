@@ -1,0 +1,10 @@
+node_modules/
+*.log
+.DS_Store
+*.tgz
+
+# The CLI writes generated images to the current directory by default
+banaverse-*.png
+banaverse-*.jpg
+banaverse-*.jpeg
+banaverse-*.webp

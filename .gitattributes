@@ -1,0 +1,9 @@
+# Keep LF in the repo and on checkout everywhere, so the shebang scripts
+# (#!/usr/bin/env node) run on macOS/Linux and when published to npm.
+* text=auto eol=lf
+
+# Generated image outputs are never text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary

@@ -1,0 +1,40 @@
+{
+  "name": "@banaverse/cli",
+  "version": "0.1.0",
+  "description": "Banaverse for any AI — generate images from the terminal, or connect Banaverse to Claude, ChatGPT/Codex, and any MCP-compatible agent.",
+  "keywords": [
+    "banaverse",
+    "ai",
+    "image-generation",
+    "text-to-image",
+    "mcp",
+    "cli",
+    "gemini",
+    "nano-banana"
+  ],
+  "homepage": "https://github.com/The-Pocket-Company/Banaverse-CLI#readme",
+  "bugs": {
+    "url": "https://github.com/The-Pocket-Company/Banaverse-CLI/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/The-Pocket-Company/Banaverse-CLI.git"
+  },
+  "license": "MIT",
+  "author": "The Pocket Company",
+  "type": "module",
+  "bin": {
+    "banaverse": "bin/banaverse.mjs",
+    "banaverse-mcp": "mcp/banaverse-mcp.mjs"
+  },
+  "files": [
+    "bin",
+    "mcp",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
