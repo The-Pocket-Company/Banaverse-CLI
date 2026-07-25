@@ -44,7 +44,7 @@ function resolved(flags) {
 // ── args ────────────────────────────────────────────────────────────────
 // 只有這些旗標「吃下一個值」；其餘一律布林（如 --yes）——否則 `generate --yes "貓"`
 // 會把提示當成 --yes 的值吞掉，或 `--out`（漏值）變成 true 導致扣點後才炸在存檔。
-const VALUE_FLAGS = new Set(['url', 'key', 'model', 'aspect', 'size', 'out', 'label']);
+const VALUE_FLAGS = new Set(['url', 'key', 'model', 'aspect', 'size', 'out', 'label', 'seconds']);
 function parse(argv) {
   const pos = [];
   const flags = {};
@@ -181,20 +181,29 @@ async function cmdWhoami(flags) {
 async function cmdModels(flags) {
   const { url } = resolved(flags);
   const d = await api('/api/v1/models', { url });
-  console.log('可用圖片模型（售價／次）：');
-  for (const m of d.models) console.log(`  ${m.default ? '★' : ' '} ${m.id.padEnd(30)} ${m.label.padEnd(18)} ${m.credits} 點`);
-  console.log('  （★＝預設；生成時用 --model <id> 指定其他）');
+  const row = (m) => `  ${m.default ? '★' : ' '} ${m.id.padEnd(32)} ${m.label.padEnd(18)} ${m.credits} 點`;
+  const imgs = d.models.filter((m) => m.kind !== 'video');
+  const vids = d.models.filter((m) => m.kind === 'video');
+  console.log('圖片模型（售價／次）：');
+  for (const m of imgs) console.log(row(m));
+  if (vids.length) {
+    console.log('\n影片模型（售價／次，生成約 1–5 分鐘）：');
+    for (const m of vids) console.log(row(m));
+    console.log('\n  影片用：banaverse generate "…" --video');
+  }
+  console.log('  （★＝預設；用 --model <id> 指定其他）');
 }
 
 async function cmdGenerate(pos, flags) {
   const { url, key } = resolved(flags);
   if (!key) fail('尚未登入。先跑：banaverse login');
   const prompt = pos.join(' ').trim();
-  if (!prompt) fail('缺少提示。用法：banaverse generate "一隻賽博龐克貓" [--model …] [--out cat.png] [--yes]');
+  if (!prompt) fail('缺少提示。用法：banaverse generate "一隻賽博龐克貓" [--video] [--model …] [--out cat.png] [--yes]');
 
-  // 查售價（生成前確認用）
+  // --video，或 --model 指到影片模型 → 走影片（非同步長任務）
   const catalog = await api('/api/v1/models', { url });
-  const chosen = flags.model || catalog.models.find((m) => m.default)?.id;
+  const wantVideo = !!flags.video || catalog.models.some((m) => m.id === flags.model && m.kind === 'video');
+  const chosen = flags.model || catalog.models.find((m) => m.default && (wantVideo ? m.kind === 'video' : m.kind !== 'video'))?.id;
   const info = catalog.models.find((m) => m.id === chosen);
   if (!info) fail(`未知模型：${chosen}。可用：${catalog.models.map((m) => m.id).join(', ')}`);
 
@@ -207,6 +216,8 @@ async function cmdGenerate(pos, flags) {
       fail(`這會花 ${info.credits} 點（${info.label}）。確認後加 --yes 再跑（或先 banaverse models 看價格）。`);
     }
   }
+
+  if (info.kind === 'video') return await generateVideo({ url, key, prompt, chosen, info, flags });
 
   process.stderr.write(`⏳ 生成中（${info.label}）…\n`);
   const r = await api('/api/v1/generate', {
@@ -224,27 +235,81 @@ async function cmdGenerate(pos, flags) {
   console.log(`✓ 生成完成（花 ${r.credits} 點）→ ${out}`);
 }
 
+// 影片是長任務：POST 只拿到 jobId，要輪詢 /api/v1/jobs/{id} 直到 done。
+// 伺服器完成後會把影片放上 Cloud Storage 並回公開網址，這裡直接抓那個網址存檔。
+async function generateVideo({ url, key, prompt, chosen, info, flags }) {
+  const sub = await api('/api/v1/generate', {
+    method: 'POST', url, key,
+    body: { kind: 'video', prompt, model: chosen, aspectRatio: flags.aspect, durationSec: flags.seconds ? Number(flags.seconds) : undefined },
+  });
+  if (!sub.jobId) fail('沒有拿到 jobId。');
+  process.stderr.write(`⏳ 影片生成中（${info.label}）…通常 1–5 分鐘，可按 Ctrl+C 離開，之後用 jobId 再取：\n   ${sub.jobId}\n`);
+
+  const started = Date.now();
+  const LIMIT_MS = 15 * 60 * 1000; // 15 分鐘還沒好就把 jobId 留給使用者自己取，不要無限掛著
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 10000));
+    const j = await api(`/api/v1/jobs/${encodeURIComponent(sub.jobId)}`, { url, key });
+    if (j.done) {
+      if (!j.url) fail('影片完成但沒有網址。');
+      const res = await fetch(j.url);
+      if (!res.ok) fail(`影片下載失敗：HTTP ${res.status}`);
+      const out = pathResolve(flags.out || `banaverse-${stamp()}.mp4`);
+      writeFileSync(out, Buffer.from(await res.arrayBuffer()));
+      console.log(`✓ 影片完成（花 ${j.credits} 點）→ ${out}`);
+      return;
+    }
+    process.stderr.write(`   …${Math.round((j.progress || 0) * 100)}%\r`);
+    if (Date.now() - started > LIMIT_MS) {
+      console.log(`\n仍在生成中。稍後用這個 jobId 取件：\n  banaverse job ${sub.jobId}`);
+      return;
+    }
+  }
+}
+
+/** 取件既有的影片工單（generate 中途離開後用）。 */
+async function cmdJob(pos, flags) {
+  const { url, key } = resolved(flags);
+  if (!key) fail('尚未登入。先跑：banaverse login');
+  const jobId = pos.join(' ').trim();
+  if (!jobId) fail('用法：banaverse job <jobId>');
+  const j = await api(`/api/v1/jobs/${encodeURIComponent(jobId)}`, { url, key });
+  if (!j.done) { console.log(`還在生成中（${Math.round((j.progress || 0) * 100)}%）。稍後再試。`); return; }
+  if (!j.url) fail('影片完成但沒有網址。');
+  const res = await fetch(j.url);
+  if (!res.ok) fail(`影片下載失敗：HTTP ${res.status}`);
+  const out = pathResolve(flags.out || `banaverse-${stamp()}.mp4`);
+  writeFileSync(out, Buffer.from(await res.arrayBuffer()));
+  console.log(`✓ 影片完成（花 ${j.credits} 點）→ ${out}`);
+}
+
 function stamp() {
   const d = new Date();
   const p = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
-const HELP = `banaverse — Banaverse 生成 CLI（文字生成圖片）
+const HELP = `banaverse — Banaverse 生成 CLI（文字生成圖片／影片）
 
 用法：
   banaverse login [--url <base>]                   瀏覽器登入（開瀏覽器授權，免貼金鑰）
   banaverse whoami                                  帳號與點數餘額
-  banaverse models                                  可用圖片模型與售價
-  banaverse generate "<提示>" [選項]                 生成圖片
+  banaverse models                                  可用圖片／影片模型與售價
+  banaverse generate "<提示>" [選項]                 生成圖片（加 --video 生成影片）
+  banaverse job <jobId>                             取回先前送出的影片
   banaverse logout                                  清除本機設定
 
 generate 選項：
-  --model <id>     指定模型（預設＝Nano Banana 2 Lite）
-  --aspect <比例>  1:1 / 16:9 / 9:16 …（預設 1:1）
-  --size <解析度>  512 / 1K / 2K / 4K（預設 1K）
-  --out <檔名>     輸出檔（預設 banaverse-<時間>.png）
+  --video          生成影片（長任務，會自動輪詢到完成；預設 Veo 3.1 Lite）
+  --model <id>     指定模型（預設＝Nano Banana 2 Lite；影片預設 Veo 3.1 Lite）
+  --aspect <比例>  1:1 / 16:9 / 9:16 …（圖片預設 1:1、影片 16:9）
+  --size <解析度>  512 / 1K / 2K / 4K（預設 1K，僅圖片）
+  --seconds <秒>   影片長度（依模型支援範圍）
+  --out <檔名>     輸出檔（預設 banaverse-<時間>.png ／ .mp4）
   --yes            跳過「花 N 點」確認（agent 請先向使用者確認再帶此旗標）
+
+影片會花較多點數（Veo Lite 100 點起），且需 1–5 分鐘。中途 Ctrl+C 離開後，
+可用印出來的 jobId 跑 banaverse job <jobId> 取回。
 
 登入：banaverse login 會開瀏覽器授權，登入後自動存下一把金鑰（不用手動貼）。
 進階：也可 --key <bnv_…> 直接帶金鑰，或用環境變數 BANAVERSE_API_KEY / BANAVERSE_URL。`;
@@ -260,6 +325,7 @@ async function main() {
     case 'whoami': return cmdWhoami(flags);
     case 'models': return cmdModels(flags);
     case 'generate': case 'gen': return cmdGenerate(pos, flags);
+    case 'job': return cmdJob(pos, flags);
     case undefined: case 'help': case '--help': case '-h': console.log(HELP); return;
     default: console.error(`未知指令：${cmd}\n`); console.log(HELP); process.exit(1);
   }

@@ -42,6 +42,27 @@ Prefer the globally installed `banaverse` command (`npm i -g @banaverse/cli`). I
 
 4. **Report the result**: print the saved file path and confirm the charge via the balance change. On failure (402 insufficient credits / 502 generation failed), relay the error verbatim; failed generations are auto‑refunded.
 
+## Video
+
+Same flow, plus `--video`. Video is a **long job** (1–5 minutes) and costs far more than an image
+(Veo 3.1 Lite is 100 credits vs 5 for the cheapest image) — **the cost confirmation matters even more here**.
+
+```bash
+banaverse generate "<a clear, specific prompt>" --video --aspect 16:9 --seconds 4 --out clip.mp4 --yes
+```
+
+- The command submits, then polls until done and saves the `.mp4` — no extra step needed.
+- It prints a `jobId` first. If the user interrupts, retrieve it later with `banaverse job <jobId>`; do **not** re-run `generate`, that would charge again.
+- `banaverse models` lists video models and prices alongside the image ones.
+
+## MCP alternative
+
+The same account also exposes an MCP server at `https://banaverse.thepocket.company/api/mcp`
+(tools: `banaverse_generate_image`, `banaverse_generate_video` + `banaverse_get_video`,
+`banaverse_list_models`, `banaverse_get_balance`). If those tools are already available in this
+session, prefer them — no install needed. The CLI is the better choice when the user wants the
+file written to disk, since MCP returns a URL rather than a local file.
+
 ## Hard rules
 
 - **Never** pass `--yes` before the user has confirmed the cost.

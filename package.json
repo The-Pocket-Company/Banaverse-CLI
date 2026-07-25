@@ -1,7 +1,7 @@
 {
   "name": "@banaverse/cli",
-  "version": "0.1.0",
-  "description": "Banaverse for any AI — generate images from the terminal, or connect Banaverse to Claude, ChatGPT/Codex, and any MCP-compatible agent.",
+  "version": "0.2.0",
+  "description": "Banaverse for any AI — generate images and video from the terminal, or connect Banaverse to Claude, ChatGPT/Codex, and any MCP-compatible agent.",
   "keywords": [
     "banaverse",
     "ai",
@@ -10,7 +10,9 @@
     "mcp",
     "cli",
     "gemini",
-    "nano-banana"
+    "nano-banana",
+    "video",
+    "veo"
   ],
   "homepage": "https://github.com/The-Pocket-Company/Banaverse-CLI#readme",
   "bugs": {

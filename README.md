@@ -1,8 +1,9 @@
 # Banaverse CLI
 
-**Banaverse for any AI.** Generate images from your terminal, or plug Banaverse into Claude, ChatGPT / Codex, and any MCP‑compatible agent — using the same account, credits, and models as the [Banaverse](https://banaverse.thepocket.company) web canvas.
+**Banaverse for any AI.** Generate images and video from your terminal, or plug Banaverse into Claude, ChatGPT / Codex, and any MCP‑compatible agent — using the same account, credits, and models as the [Banaverse](https://banaverse.thepocket.company) web canvas.
 
 - 🖼️ **Text‑to‑image** from the command line — `banaverse generate "…"`
+- 🎬 **Text‑to‑video** — `banaverse generate "…" --video` (Veo; long job, polls and saves the .mp4 for you)
 - 🔌 **MCP server** — connect Banaverse to Claude Desktop / Claude Code / any MCP client
 - 🤖 **Agent‑ready** — a bundled skill teaches coding agents to drive the CLI safely
 - 🔑 **One sign‑in** — browser OAuth; no API keys to copy or paste
@@ -23,6 +24,7 @@ Requires **Node 18+**. No runtime dependencies.
 ```bash
 banaverse login                 # opens your browser to sign in with Google
 banaverse generate "a cyberpunk cat under a neon sign"
+banaverse generate "a duck bobbing on calm water" --video   # 影片（長任務，1–5 分鐘）
 ```
 
 `login` runs a standard OAuth 2.1 flow (PKCE + loopback) and stores a long‑lived key in `~/.banaverse/config.json` — you never handle the key yourself. The MCP server reuses the same sign‑in.
@@ -33,18 +35,21 @@ banaverse generate "a cyberpunk cat under a neon sign"
 |---|---|
 | `banaverse login` | Browser sign‑in (OAuth). Advanced: `--key <bnv_…>` to use an existing key. |
 | `banaverse whoami` | Show the signed‑in account and credit balance. |
-| `banaverse models` | List available image models and their per‑image price. |
-| `banaverse generate "<prompt>"` | Generate an image. Confirms the cost first (skip with `--yes`). |
+| `banaverse models` | List available image and video models with their prices. |
+| `banaverse generate "<prompt>"` | Generate an image — add `--video` for video. Confirms the cost first (skip with `--yes`). |
+| `banaverse job <jobId>` | Retrieve a video you submitted earlier (if you interrupted `generate`). |
 | `banaverse logout` | Remove the local config. |
 
 ### `generate` options
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--model <id>` | Model to use (see `banaverse models`) | cheapest (Nano Banana 2 Lite) |
+| `--video` | Generate video instead of an image (long job, 1–5 min) | off |
+| `--model <id>` | Model to use (see `banaverse models`) | cheapest (Nano Banana 2 Lite / Veo 3.1 Lite) |
 | `--aspect <ratio>` | `1:1` / `16:9` / `9:16` … | `1:1` |
-| `--size <res>` | `512` / `1K` / `2K` / `4K` | `1K` |
-| `--out <file>` | Output path | `banaverse-<timestamp>.png` |
+| `--size <res>` | `512` / `1K` / `2K` / `4K` (images only) | `1K` |
+| `--seconds <n>` | Video length (per model limits) | model default |
+| `--out <file>` | Output path | `banaverse-<timestamp>.png` / `.mp4` |
 | `--yes` | Skip the "spend N credits?" confirmation | interactive prompt |
 
 ## Use it from your AI tools
@@ -63,7 +68,7 @@ After `npm install -g @banaverse/cli`, register the bundled MCP server. Example 
 }
 ```
 
-It exposes three tools — `banaverse_generate_image`, `banaverse_list_models`, `banaverse_get_balance` — and authenticates with the key from `banaverse login` (or `BANAVERSE_API_KEY`).
+It exposes `banaverse_generate_image`, `banaverse_generate_video` + `banaverse_get_video`, `banaverse_list_models`, `banaverse_get_balance` — and authenticates with the key from `banaverse login` (or `BANAVERSE_API_KEY`).
 
 > Prefer a hosted, no‑install option? The Banaverse web app also offers a **remote MCP connector** (paste a URL, sign in with Google) — see the **MCP & CLI** panel in your account menu on [banaverse.thepocket.company](https://banaverse.thepocket.company).
 
