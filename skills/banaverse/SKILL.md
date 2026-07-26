@@ -9,7 +9,22 @@ Call Banaverse through the `banaverse` CLI to generate images. The CLI shares th
 
 ## The command
 
-Prefer the globally installed `banaverse` command (`npm i -g @banaverse/cli`). If it isn't installed, use `npx @banaverse/cli` in its place. (Below always says `banaverse`.)
+Prefer the globally installed `banaverse` command. If it isn't installed yet, install it:
+
+```bash
+npm i -g @banaverse/cli
+```
+
+If you can't install globally, the one-off form is `npx -p @banaverse/cli banaverse <subcommand>`.
+
+> `npx @banaverse/cli` **does not work** — it fails with `could not determine executable to run`,
+> because the package is `@banaverse/cli` but the binary is `banaverse`. That error does **not** mean
+> the package is private or missing; it is public. Use one of the two forms above.
+
+Never fall back to a `cli/banaverse.mjs` file inside a checked-out repo. That copy is frozen, has no
+video support, and is marked private — running it gives behaviour that does not match this document.
+
+(Below always says `banaverse`.)
 
 ## Standard flow
 
