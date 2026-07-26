@@ -1,6 +1,6 @@
 ---
 name: banaverse
-description: Generate images with Banaverse (Nano Banana / Gemini image models) from the command line. Use when the user wants to create / draw / make an image and mentions Banaverse, or wants to spend Banaverse credits to generate an image. Generating spends credits, so always confirm the cost with the user before generating.
+description: Generate images and video with Banaverse (Nano Banana images, Veo video) from the command line, from a text prompt or from reference images. Use when the user wants to create / draw / make an image, make a video or animate a picture, and mentions Banaverse, or wants to spend Banaverse credits to generate. Generating spends credits, so always confirm the cost with the user before generating.
 ---
 
 # Banaverse image generation
