@@ -51,9 +51,24 @@ Same flow, plus `--video`. Video is a **long job** (1–5 minutes) and costs far
 banaverse generate "<a clear, specific prompt>" --video --aspect 16:9 --seconds 4 --out clip.mp4 --yes
 ```
 
-- The command submits, then polls until done and saves the `.mp4` — no extra step needed.
+- The command submits, then polls until done and saves the `.mp4` — no extra step needed
+  (checks every 10s, gives up after 15 minutes and hands you back the `jobId`).
 - It prints a `jobId` first. If the user interrupts, retrieve it later with `banaverse job <jobId>`; do **not** re-run `generate`, that would charge again.
 - `banaverse models` lists video models and prices alongside the image ones.
+
+### Always run video in the background
+
+Video takes 1–5 minutes. **Run the video command as a background job** — in Claude Code, use the
+Bash tool with `run_in_background: true`. The command polls to completion and writes the `.mp4`
+before exiting, so you get a completion notification and can report back then.
+
+Tell the user "submitted, ~N minutes, I'll let you know" and **carry on with other work** —
+do not sit and wait.
+
+Do **not** use the MCP route (`banaverse_generate_video` + repeated `banaverse_get_video`) for
+long video jobs. MCP tools are synchronous, so polling that way blocks the conversation and burns
+tokens on every check. MCP suits "the user just wants a URL and is happy to wait"; use the CLI
+when it should run in the background.
 
 ## MCP alternative
 
