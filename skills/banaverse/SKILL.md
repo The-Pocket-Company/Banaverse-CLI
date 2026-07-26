@@ -70,6 +70,26 @@ long video jobs. MCP tools are synchronous, so polling that way blocks the conve
 tokens on every check. MCP suits "the user just wants a URL and is happy to wait"; use the CLI
 when it should run in the background.
 
+## Reference images — image-to-image and image-to-video
+
+Pass `--ref` to work from an existing image; repeat it for multiple references:
+
+```bash
+banaverse generate "change the background to night" --ref photo.jpg --out night.png --yes
+banaverse generate "have him turn to camera, slow push in" --ref photo.jpg --video --out clip.mp4 --yes
+```
+
+- Takes local file paths (png/jpg/webp/gif), plus data URLs and URLs Banaverse itself returned.
+- **Other sites' image URLs are rejected** (the server only trusts its own storage, for SSRF safety) —
+  download the image locally first, then `--ref` it.
+- Video: one reference on Veo animates it as the first frame; Veo 3.1/Fast with several switches to
+  reference images; Seedance/Omni always treat them as reference images.
+- If the chosen model can't take references, the call fails with a 400 explaining why — it will
+  **not** silently ignore them and still charge.
+
+With `--ref`, write the prompt as **what to change / how it should move**, not a fresh description
+of the whole picture.
+
 ## MCP alternative
 
 The same account also exposes an MCP server at `https://banaverse.thepocket.company/api/mcp`

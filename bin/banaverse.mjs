@@ -44,7 +44,8 @@ function resolved(flags) {
 // ── args ────────────────────────────────────────────────────────────────
 // 只有這些旗標「吃下一個值」；其餘一律布林（如 --yes）——否則 `generate --yes "貓"`
 // 會把提示當成 --yes 的值吞掉，或 `--out`（漏值）變成 true 導致扣點後才炸在存檔。
-const VALUE_FLAGS = new Set(['url', 'key', 'model', 'aspect', 'size', 'out', 'label', 'seconds']);
+const VALUE_FLAGS = new Set(['url', 'key', 'model', 'aspect', 'size', 'out', 'label', 'seconds', 'ref']);
+const REPEATABLE = new Set(['ref']); // 可重複給的旗標 → 收成陣列（多張參考圖）
 function parse(argv) {
   const pos = [];
   const flags = {};
@@ -55,13 +56,32 @@ function parse(argv) {
       if (VALUE_FLAGS.has(k)) {
         const nxt = argv[i + 1];
         if (nxt === undefined || nxt.startsWith('--')) fail(`旗標 --${k} 需要一個值。`); // 早退，避免扣點後才失敗
-        flags[k] = nxt; i++;
+        if (REPEATABLE.has(k)) (flags[k] ??= []).push(nxt);
+        else flags[k] = nxt;
+        i++;
       } else {
         flags[k] = true; // 布林旗標（--yes / --help …），不吃下一個 token
       }
     } else pos.push(a);
   }
   return { pos, flags };
+}
+
+// --ref：本機檔案路徑 → data URL；已經是 data:/https: 就原樣送。
+// 伺服器端只收 data URL、base64、或 Banaverse 自己回傳的網址（防 SSRF），
+// 所以外部圖片網址在這裡就會被伺服器擋成 400，不會白扣點。
+const REF_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' };
+function readRefs(flags) {
+  const list = Array.isArray(flags.ref) ? flags.ref : flags.ref ? [flags.ref] : [];
+  return list.map((r) => {
+    if (/^(data:|https?:)/i.test(r)) return r;
+    const p = pathResolve(r);
+    if (!existsSync(p)) fail(`找不到參考圖：${r}`);
+    const ext = (p.split('.').pop() || '').toLowerCase();
+    const mime = REF_MIME[ext];
+    if (!mime) fail(`參考圖格式不支援：${r}（支援 png / jpg / webp / gif）`);
+    return `data:${mime};base64,${readFileSync(p).toString('base64')}`;
+  });
 }
 
 // ── http ────────────────────────────────────────────────────────────────
@@ -207,6 +227,9 @@ async function cmdGenerate(pos, flags) {
   const info = catalog.models.find((m) => m.id === chosen);
   if (!info) fail(`未知模型：${chosen}。可用：${catalog.models.map((m) => m.id).join(', ')}`);
 
+  // 參考圖先讀進來：路徑打錯就在問使用者之前失敗，不會確認完、扣了點才發現檔案不存在。
+  const refs = readRefs(flags);
+
   // 生成前確認（花點數）：--yes 跳過；互動終端問 y/N；非互動（agent/pipe）要求 --yes
   if (!flags.yes) {
     if (stdin.isTTY && stdout.isTTY) {
@@ -217,12 +240,12 @@ async function cmdGenerate(pos, flags) {
     }
   }
 
-  if (info.kind === 'video') return await generateVideo({ url, key, prompt, chosen, info, flags });
+  if (info.kind === 'video') return await generateVideo({ url, key, prompt, chosen, info, flags, refs });
 
   process.stderr.write(`⏳ 生成中（${info.label}）…\n`);
   const r = await api('/api/v1/generate', {
     method: 'POST', url, key,
-    body: { prompt, model: chosen, aspectRatio: flags.aspect, imageSize: flags.size },
+    body: { prompt, model: chosen, aspectRatio: flags.aspect, imageSize: flags.size, refs: refs.length ? refs : undefined },
   });
   if (!r.dataUrl) fail('沒有拿到影像。');
 
@@ -237,10 +260,14 @@ async function cmdGenerate(pos, flags) {
 
 // 影片是長任務：POST 只拿到 jobId，要輪詢 /api/v1/jobs/{id} 直到 done。
 // 伺服器完成後會把影片放上 Cloud Storage 並回公開網址，這裡直接抓那個網址存檔。
-async function generateVideo({ url, key, prompt, chosen, info, flags }) {
+async function generateVideo({ url, key, prompt, chosen, info, flags, refs = [] }) {
   const sub = await api('/api/v1/generate', {
     method: 'POST', url, key,
-    body: { kind: 'video', prompt, model: chosen, aspectRatio: flags.aspect, durationSec: flags.seconds ? Number(flags.seconds) : undefined },
+    body: {
+      kind: 'video', prompt, model: chosen, aspectRatio: flags.aspect,
+      durationSec: flags.seconds ? Number(flags.seconds) : undefined,
+      refs: refs.length ? refs : undefined,
+    },
   });
   if (!sub.jobId) fail('沒有拿到 jobId。');
   process.stderr.write(`⏳ 影片生成中（${info.label}）…通常 1–5 分鐘，可按 Ctrl+C 離開，之後用 jobId 再取：\n   ${sub.jobId}\n`);
@@ -295,12 +322,15 @@ const HELP = `banaverse — Banaverse 生成 CLI（文字生成圖片／影片�
   banaverse login [--url <base>]                   瀏覽器登入（開瀏覽器授權，免貼金鑰）
   banaverse whoami                                  帳號與點數餘額
   banaverse models                                  可用圖片／影片模型與售價
-  banaverse generate "<提示>" [選項]                 生成圖片（加 --video 生成影片）
+  banaverse generate "<提示>" [選項]                 生成圖片（加 --video 生成影片；加 --ref 用參考圖）
   banaverse job <jobId>                             取回先前送出的影片
   banaverse logout                                  清除本機設定
 
 generate 選項：
   --video          生成影片（長任務，會自動輪詢到完成；預設 Veo 3.1 Lite）
+  --ref <檔案>     參考圖：圖生圖／圖生影片。可重複給多張（--ref a.png --ref b.png）。
+                   吃本機檔案路徑（png/jpg/webp/gif），也接受 data URL 或 Banaverse 回傳的網址。
+                   影片：Veo 一張＝首幀動畫化；Seedance／Omni 一律當參考圖。
   --model <id>     指定模型（預設＝Nano Banana 2 Lite；影片預設 Veo 3.1 Lite）
   --aspect <比例>  1:1 / 16:9 / 9:16 …（圖片預設 1:1、影片 16:9）
   --size <解析度>  512 / 1K / 2K / 4K（預設 1K，僅圖片）
