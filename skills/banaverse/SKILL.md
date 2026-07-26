@@ -1,11 +1,25 @@
 ---
 name: banaverse
-description: Generate images and video with Banaverse (Nano Banana images, Veo video) from the command line, from a text prompt or from reference images. Use when the user wants to create / draw / make an image, make a video or animate a picture, and mentions Banaverse, or wants to spend Banaverse credits to generate. Generating spends credits, so always confirm the cost with the user before generating.
+description: Generate images and video with Banaverse (Nano Banana images, Veo video), from a text prompt or from reference images — via the Banaverse MCP tools if they are available in this session, otherwise via the banaverse CLI. Use when the user wants to create / draw / make an image, make a video or animate a picture, and mentions Banaverse, or wants to spend Banaverse credits to generate. Generating spends credits, so always confirm the cost with the user before generating.
 ---
 
-# Banaverse image generation
+# Banaverse image and video generation
 
-Call Banaverse through the `banaverse` CLI to generate images. The CLI shares the **same account and credit wallet** as the Banaverse website — generating here spends the user's credits. **Always confirm the cost with the user before spending.**
+Banaverse shares the **same account and credit wallet** as the Banaverse website — generating here
+spends the user's credits. **Always confirm the cost with the user before spending.**
+
+## Pick your route first
+
+There are two ways in. Check which one you have **before** doing anything else:
+
+1. **MCP tools** — if `banaverse_generate_image` / `banaverse_generate_video` are in your tool list,
+   **use them** and skip the CLI entirely. Nothing to install.
+2. **The `banaverse` CLI** — use this when the MCP tools aren't there, or when the user wants the
+   file written to disk (MCP returns a URL, not a local file).
+
+If the user just connected the Banaverse MCP server and the tools are still missing, that is normal:
+tool lists don't hot-reload. Say so, and either use the CLI route or ask them to start a new session.
+Do **not** conclude the connection failed.
 
 ## The command
 
