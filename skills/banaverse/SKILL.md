@@ -21,6 +21,19 @@ If the user just connected the Banaverse MCP server and the tools are still miss
 tool lists don't hot-reload. Say so, and either use the CLI route or ask them to start a new session.
 Do **not** conclude the connection failed.
 
+### If your runtime has its own built-in image generator
+
+Some agents ship a free built-in image tool. **Don't silently substitute one for the other** — say
+which one you used, either way. Rough rule:
+
+- **Their built-in** is usually free and fine for a quick throwaway picture.
+- **Banaverse** is the right call when the user asks for it by name, or needs something the built-in
+  can't do: **video** (Veo), **animating a still image**, **multiple reference images**, or results
+  tied to their **Banaverse account and credit wallet** so they show up alongside their other work.
+
+Banaverse spends real credits, so never reach for it just because it is there — but equally, never
+quietly swap in a different generator when the user asked for Banaverse.
+
 ## The command
 
 Prefer the globally installed `banaverse` command. If it isn't installed yet, install it:
