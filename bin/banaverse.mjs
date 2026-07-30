@@ -42,25 +42,30 @@ function resolved(flags) {
 }
 
 // ── args ────────────────────────────────────────────────────────────────
-// 只有這些旗標「吃下一個值」；其餘一律布林（如 --yes）——否則 `generate --yes "貓"`
-// 會把提示當成 --yes 的值吞掉，或 `--out`（漏值）變成 true 導致扣點後才炸在存檔。
+// 只有這些旗標「吃下一個值」；布林旗標白名單明列——**不認識的旗標一律直接報錯**。
+// 教訓（2026-07-29 實測）：舊版把未知旗標默默當布林，`--ref a.png` 在還沒有 --ref 的版本上
+// 被吞掉、a.png 變成提示詞的一部分，八次生成 40 點全變成無參考的錯圖，全程零錯誤訊息。
+// 拼錯參數的代價不能是「扣了點才發現」。
 const VALUE_FLAGS = new Set(['url', 'key', 'model', 'aspect', 'size', 'out', 'label', 'seconds', 'ref']);
 const REPEATABLE = new Set(['ref']); // 可重複給的旗標 → 收成陣列（多張參考圖）
+const BOOL_FLAGS = new Set(['yes', 'video', 'help', 'h']);
 function parse(argv) {
   const pos = [];
   const flags = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a.startsWith('--')) {
-      const k = a.slice(2);
+    if (a.startsWith('--') || (a.startsWith('-') && a.length === 2 && !/^-\d/.test(a))) {
+      const k = a.replace(/^--?/, '');
       if (VALUE_FLAGS.has(k)) {
         const nxt = argv[i + 1];
         if (nxt === undefined || nxt.startsWith('--')) fail(`旗標 --${k} 需要一個值。`); // 早退，避免扣點後才失敗
         if (REPEATABLE.has(k)) (flags[k] ??= []).push(nxt);
         else flags[k] = nxt;
         i++;
+      } else if (BOOL_FLAGS.has(k)) {
+        flags[k] = true;
       } else {
-        flags[k] = true; // 布林旗標（--yes / --help …），不吃下一個 token
+        fail(`未知參數：--${k}（拼錯了嗎？）。可用參數見：banaverse help`);
       }
     } else pos.push(a);
   }
@@ -349,6 +354,7 @@ async function main() {
   if (argv[0] === 'auth') argv = argv.slice(1); // 支援 "banaverse auth login"
   const { pos, flags } = parse(argv.slice(1));
   const cmd = argv[0];
+  if (flags.help || flags.h) { console.log(HELP); return; } // `banaverse generate --help` 也要能看說明
   switch (cmd) {
     case 'login': return cmdLogin(flags);
     case 'logout': return cmdLogout();
