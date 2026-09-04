@@ -27,7 +27,7 @@ banaverse generate "a cyberpunk cat under a neon sign"
 banaverse generate "a duck bobbing on calm water" --video   # 影片（長任務，1–5 分鐘）
 ```
 
-`login` runs a standard OAuth 2.1 flow (PKCE + loopback) and stores a long‑lived key in `~/.banaverse/config.json` — you never handle the key yourself. The MCP server reuses the same sign‑in.
+`login` runs a standard OAuth 2.1 flow (PKCE + loopback) and stores the resulting tokens in `~/.banaverse/config.json`; they refresh automatically, so you never handle a key yourself. The MCP server reuses the same sign‑in.
 
 ## Commands
 
@@ -88,8 +88,8 @@ banaverse generate "…" --yes
 
 ## Auth & safety
 
-- Keys are `bnv_…` bearer tokens, stored **server‑side as SHA‑256 hashes** and revocable at any time.
-- The CLI writes the key only to `~/.banaverse/config.json` in your home directory; it never prints your key.
+- Browser sign‑in stores short‑lived OAuth tokens (access 1 h, refresh 30 d, rotated on every refresh) in `~/.banaverse/config.json`; `banaverse logout` deletes them. Revoking the connector on the website invalidates them immediately.
+- API keys (`bnv_…`, for CI or `--key`) are stored **server‑side as SHA‑256 hashes** and revocable at any time; the CLI never prints your key.
 - `generate` **confirms the credit cost first**. In non‑interactive contexts (pipes, agents) it refuses to spend until you pass `--yes`, so an agent must get your OK before charging.
 
 ## License

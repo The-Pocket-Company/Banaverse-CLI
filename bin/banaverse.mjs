@@ -7,38 +7,32 @@
 //   banaverse generate "<提示>"   生成圖片（預設先顯示花費並確認；--yes 跳過）
 //   banaverse logout            清除本機設定
 //
-// 認證：`banaverse login` 走 OAuth 2.1（PKCE + loopback），登入後自動存一把長效金鑰到
-//       ~/.banaverse/config.json，之後免再登入；MCP server 也沿用同一把。
+// 認證：`banaverse login` 走 OAuth 2.1（PKCE + loopback），登入後把 access／refresh token
+//       存到 ~/.banaverse/config.json，之後自動續期；MCP server 讀同一份。
+//       **不再拿 token 去換一把長效金鑰**——伺服器 2026-08-14 起金鑰管理只收網站正式登入
+//       （擋連接器鑄永久金鑰的漏洞），CLI 的 OAuth token 正好是被擋的那種，繞那條路只會失敗。
+//       生成、取件、模型、餘額這些端點本來就吃 OAuth token，沒有必要多一層金鑰。理由見 lib/auth.mjs。
 //       進階／CI 可帶 --key <bnv_…> 或環境變數 BANAVERSE_API_KEY / BANAVERSE_URL。
 // 相依：零（Node 18+ 內建 fetch / readline / http / crypto）。
 // 專案：https://github.com/The-Pocket-Company/Banaverse-CLI
 // ============================================================================
-import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join, resolve as pathResolve } from 'node:path';
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { resolve as pathResolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
+import { CFG_FILE, DEFAULT_URL, loadCfg, saveCfg, clearCfg, bearer } from '../lib/auth.mjs';
 import { createServer } from 'node:http';
 import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { stdin, stdout } from 'node:process';
 
-const CFG_DIR = join(homedir(), '.banaverse');
-const CFG_FILE = join(CFG_DIR, 'config.json');
-const DEFAULT_URL = 'https://banaverse.thepocket.company'; // 正式站；本機測試自行帶 --url http://localhost:5181
-
-// ── config ──────────────────────────────────────────────────────────────
-function loadCfg() {
-  try { return JSON.parse(readFileSync(CFG_FILE, 'utf8')); } catch { return {}; }
-}
-function saveCfg(c) {
-  mkdirSync(CFG_DIR, { recursive: true });
-  writeFileSync(CFG_FILE, JSON.stringify(c, null, 2));
-}
-function resolved(flags) {
+// ── config（讀寫與換 token 都在 lib/auth.mjs，MCP server 共用）──────────────
+/** 這次要打哪個站、帶哪一把憑證。憑證可能是 --key／環境變數的金鑰，也可能是登入存下的
+ *  OAuth token（快過期會先換新）——呼叫端不用分辨，都當 Bearer 送。 */
+async function resolved(flags) {
   const c = loadCfg();
-  const url = flags.url || process.env.BANAVERSE_URL || c.url || DEFAULT_URL;
-  const key = flags.key || process.env.BANAVERSE_API_KEY || c.key || '';
-  return { url: url.replace(/\/$/, ''), key };
+  const url = (flags.url || process.env.BANAVERSE_URL || c.url || DEFAULT_URL).replace(/\/$/, '');
+  const key = await bearer(url, { key: flags.key, env: process.env });
+  return { url, key };
 }
 
 // ── args ────────────────────────────────────────────────────────────────
@@ -90,7 +84,7 @@ function readRefs(flags) {
 }
 
 // ── http ────────────────────────────────────────────────────────────────
-async function api(path, { method = 'GET', body, url, key } = {}) {
+async function api(path, { method = 'GET', body, url, key, _retried = false } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (key) headers.Authorization = `Bearer ${key}`;
   let res;
@@ -99,7 +93,14 @@ async function api(path, { method = 'GET', body, url, key } = {}) {
   } catch (e) {
     fail(`連不到 ${url}${path}（${e.message}）。dev server 有開嗎？（npm run dev）或用 --url 指定。`);
   }
+  // 401 且帶的是登入存下的 token：可能剛好過期（時鐘差、或上次換新沒存到），
+  // 強制換一次再試一回。換不到才是真的登出了。--key／環境變數那種金鑰換不出新的，直接落到下面報錯。
+  if (res.status === 401 && key && !_retried) {
+    const fresh = await bearer(url, { env: process.env, force: true });
+    if (fresh && fresh !== key) return api(path, { method, body, url, key: fresh, _retried: true });
+  }
   const d = await res.json().catch(() => ({}));
+  if (res.status === 401) fail('尚未登入或登入已過期。先跑：banaverse login');
   if (!res.ok) fail(`HTTP ${res.status}：${d.error ?? '未知錯誤'}`);
   return d;
 }
@@ -124,7 +125,7 @@ async function cmdLogin(flags) {
     console.log(`✓ 已登入：${me.email || me.uid}（餘額 ${me.credits} 點）  → ${CFG_FILE}`);
     return;
   }
-  // 預設：瀏覽器登入（OAuth loopback）——登入後自動發一把長效金鑰存起來，你不用碰 key。
+  // 預設：瀏覽器登入（OAuth loopback）——登入後存 token 自動續期，你不用碰 key。
   await browserLogin(url);
 }
 
@@ -181,30 +182,33 @@ async function browserLogin(url) {
   const tokData = await tok.json().catch(() => ({}));
   if (!tok.ok) fail(`授權失敗：${tokData.error_description || tokData.error || tok.status}`);
 
-  // 用 OAuth token 發一把長效個人金鑰存起來（之後直接用它、免 refresh；MCP 也讀同一把）
-  const keyRes = await fetch(url + '/api/cli/keys', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokData.access_token}` }, body: JSON.stringify({ label: 'CLI (browser login)' }) });
-  const keyData = await keyRes.json().catch(() => ({}));
-  if (!keyRes.ok || !keyData.key) fail(`發放金鑰失敗：${keyData.error || keyRes.status}`);
-
-  saveCfg({ url, key: keyData.key });
-  const me = await api('/api/v1/me', { url, key: keyData.key });
+  // 直接存 OAuth token（含 refresh 與這次註冊的 client_id——換 token 時要帶同一個）。
+  // 先前這裡會再拿 token 去 /api/cli/keys 換一把長效金鑰，那條路已被伺服器刻意擋掉，見檔頭。
+  saveCfg({
+    url,
+    clientId: regData.client_id,
+    access: tokData.access_token,
+    refresh: tokData.refresh_token,
+    expiresAt: Date.now() + (Number(tokData.expires_in) || 3600) * 1000,
+  });
+  const me = await api('/api/v1/me', { url, key: tokData.access_token });
   console.log(`✓ 已登入：${me.email || me.uid}（餘額 ${me.credits} 點）  → ${CFG_FILE}`);
 }
 
 function cmdLogout() {
-  try { if (existsSync(CFG_FILE)) rmSync(CFG_FILE); } catch {}
+  clearCfg();
   console.log('✓ 已清除本機設定。');
 }
 
 async function cmdWhoami(flags) {
-  const { url, key } = resolved(flags);
+  const { url, key } = await resolved(flags);
   if (!key) fail('尚未登入。先跑：banaverse login');
   const me = await api('/api/v1/me', { url, key });
   console.log(`${me.email || me.uid}${me.isAdmin ? '（admin，生成不扣點）' : ''}  餘額：${me.credits} 點`);
 }
 
 async function cmdModels(flags) {
-  const { url } = resolved(flags);
+  const { url } = await resolved(flags);
   const d = await api('/api/v1/models', { url });
   const row = (m) => `  ${m.default ? '★' : ' '} ${m.id.padEnd(32)} ${m.label.padEnd(18)} ${m.credits} 點`;
   const imgs = d.models.filter((m) => m.kind !== 'video');
@@ -220,7 +224,7 @@ async function cmdModels(flags) {
 }
 
 async function cmdGenerate(pos, flags) {
-  const { url, key } = resolved(flags);
+  const { url, key } = await resolved(flags);
   if (!key) fail('尚未登入。先跑：banaverse login');
   const prompt = pos.join(' ').trim();
   if (!prompt) fail('缺少提示。用法：banaverse generate "一隻賽博龐克貓" [--video] [--model …] [--out cat.png] [--yes]');
@@ -301,7 +305,7 @@ async function generateVideo({ url, key, prompt, chosen, info, flags, refs = [] 
 
 /** 取件既有的影片工單（generate 中途離開後用）。 */
 async function cmdJob(pos, flags) {
-  const { url, key } = resolved(flags);
+  const { url, key } = await resolved(flags);
   if (!key) fail('尚未登入。先跑：banaverse login');
   const jobId = pos.join(' ').trim();
   if (!jobId) fail('用法：banaverse job <jobId>');
@@ -346,7 +350,7 @@ generate 選項：
 影片會花較多點數（Veo Lite 100 點起），且需 1–5 分鐘。中途 Ctrl+C 離開後，
 可用印出來的 jobId 跑 banaverse job <jobId> 取回。
 
-登入：banaverse login 會開瀏覽器授權，登入後自動存下一把金鑰（不用手動貼）。
+登入：banaverse login 會開瀏覽器授權，登入後自動續期（不用手動貼金鑰）。
 進階：也可 --key <bnv_…> 直接帶金鑰，或用環境變數 BANAVERSE_API_KEY / BANAVERSE_URL。`;
 
 async function main() {

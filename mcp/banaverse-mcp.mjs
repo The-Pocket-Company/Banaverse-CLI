@@ -14,18 +14,13 @@
 // 專案：https://github.com/The-Pocket-Company/Banaverse-CLI
 // ============================================================================
 import { stdin, stdout, stderr, env } from 'node:process';
-import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { loadCfg, hasLogin, bearer, DEFAULT_URL } from '../lib/auth.mjs';
 
 // 認證來源優先序：環境變數 > CLI 設定檔（~/.banaverse/config.json，banaverse login 產生）> 預設。
-// → 只要跑過 `banaverse login`，MCP 免再設 env 就能沿用同一把 key。
-function cliConfig() {
-  try { return JSON.parse(readFileSync(join(homedir(), '.banaverse', 'config.json'), 'utf8')); } catch { return {}; }
-}
-const CFG = cliConfig();
-const URL_BASE = (env.BANAVERSE_URL || CFG.url || 'https://banaverse.thepocket.company').replace(/\/$/, ''); // 正式站；本機測試設 BANAVERSE_URL 或用 CLI config
-const KEY = env.BANAVERSE_API_KEY || CFG.key || '';
+// → 只要跑過 `banaverse login`，MCP 免再設 env 就能沿用同一份登入（金鑰或 OAuth token 都行，
+//   後者快過期會自動換新——邏輯在 lib/auth.mjs，跟 CLI 同一份）。
+const CFG = loadCfg();
+const URL_BASE = (env.BANAVERSE_URL || CFG.url || DEFAULT_URL).replace(/\/$/, ''); // 正式站；本機測試設 BANAVERSE_URL 或用 CLI config
 const PROTO = '2025-06-18';
 const log = (...a) => stderr.write('[banaverse-mcp] ' + a.join(' ') + '\n'); // 一律走 stderr，stdout 只留給 JSON-RPC
 
@@ -78,11 +73,16 @@ async function handle(line) {
 }
 
 // ── Banaverse API ───────────────────────────────────────────────────────────
-async function api(path, { method = 'GET', body } = {}) {
+async function api(path, { method = 'GET', body, _retried = false } = {}) {
   const headers = { 'Content-Type': 'application/json' };
-  if (KEY) headers.Authorization = `Bearer ${KEY}`;
+  // 每次呼叫現取：MCP server 會活很久，一小時前拿的 token 這一刻可能已經過期
+  const key = await bearer(URL_BASE, { env, force: _retried });
+  if (key) headers.Authorization = `Bearer ${key}`;
   const res = await fetch(URL_BASE + path, { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) });
+  // 401 且還沒重試過：強制換一次 token 再來一回（時鐘差、或上次換新沒存到）
+  if (res.status === 401 && key && !_retried) return api(path, { method, body, _retried: true });
   const d = await res.json().catch(() => ({}));
+  if (res.status === 401) throw new Error('尚未登入或登入已過期：請先跑 banaverse login');
   if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
   return d;
 }
@@ -147,4 +147,4 @@ async function callTool(name, args) {
 const textResult = (text) => ({ content: [{ type: 'text', text }] });
 const errResult = (text) => ({ content: [{ type: 'text', text: '✗ ' + text }], isError: true });
 
-log(`ready · URL=${URL_BASE} · key=${KEY ? 'set' : 'MISSING（設 BANAVERSE_API_KEY）'}`);
+log(`ready · URL=${URL_BASE} · auth=${env.BANAVERSE_API_KEY || hasLogin() ? 'set' : 'MISSING（先跑 banaverse login，或設 BANAVERSE_API_KEY）'}`);

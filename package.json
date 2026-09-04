@@ -1,6 +1,6 @@
 {
   "name": "@banaverse/cli",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Banaverse for any AI — generate images and video from the terminal, or connect Banaverse to Claude, ChatGPT/Codex, and any MCP-compatible agent.",
   "keywords": [
     "banaverse",
@@ -31,6 +31,7 @@
   },
   "files": [
     "bin",
+    "lib",
     "mcp",
     "skills",
     "README.md",
