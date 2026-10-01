@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 // ============================================================================
-// Banaverse CLI — 從終端機或 AI agent 呼叫 Banaverse 生成圖片。
+// Banaverse CLI — 從終端機或 AI agent 呼叫 Banaverse 生成圖片與影片。
 //   banaverse login             瀏覽器登入（開瀏覽器用 Google 授權，免手動貼金鑰）
 //   banaverse whoami            顯示帳號與點數餘額
-//   banaverse models            列出可用圖片模型與售價
-//   banaverse generate "<提示>"   生成圖片（預設先顯示花費並確認；--yes 跳過）
+//   banaverse models            列出可用模型與即時售價（圖片／影片／音訊／3D）
+//   banaverse generate "<提示>"   生成圖片；--video 生成影片（預設先顯示花費並確認；--yes 跳過）
+//   banaverse job <jobId>       取回先前送出的影片、排隊中的圖片或 3D
 //   banaverse logout            清除本機設定
+//
+// 音訊與 3D 只在 MCP（mcp/banaverse-mcp.mjs）與 API：音訊沒有預設模型、3D 只吃特定輸入，
+// 在終端機裡猜模型名不是好體驗。`models` 照樣列出來，讓人知道有、以及去哪裡用。
 //
 // 認證：`banaverse login` 走 OAuth 2.1（PKCE + loopback），登入後把 access／refresh token
 //       存到 ~/.banaverse/config.json，之後自動續期；MCP server 讀同一份。
@@ -20,6 +24,7 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { resolve as pathResolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { CFG_FILE, DEFAULT_URL, loadCfg, saveCfg, clearCfg, bearer } from '../lib/auth.mjs';
+import { groupModels, priceLabel, imageQuote, lockedMark, KIND_ZH } from '../lib/catalog.mjs';
 import { createServer } from 'node:http';
 import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -84,28 +89,34 @@ function readRefs(flags) {
 }
 
 // ── http ────────────────────────────────────────────────────────────────
-async function api(path, { method = 'GET', body, url, key, _retried = false } = {}) {
+// hint：失敗時接在錯誤訊息後面的一句。取件時用來把 jobId 交回給使用者——
+// 輪詢中途一個暫時性的 5xx 就讓程式結束，而使用者手上沒有取件代號的話，只剩「重跑 generate」一條路，那會再扣一次點。
+async function api(path, { method = 'GET', body, url, key, hint = '', _retried = false } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (key) headers.Authorization = `Bearer ${key}`;
   let res;
   try {
     res = await fetch(url + path, { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) });
   } catch (e) {
-    fail(`連不到 ${url}${path}（${e.message}）。dev server 有開嗎？（npm run dev）或用 --url 指定。`);
+    fail(`連不到 ${url}${path}（${e.message}）。檢查網路，或用 --url 指定站台。${hint}`);
   }
   // 401 且帶的是登入存下的 token：可能剛好過期（時鐘差、或上次換新沒存到），
   // 強制換一次再試一回。換不到才是真的登出了。--key／環境變數那種金鑰換不出新的，直接落到下面報錯。
   if (res.status === 401 && key && !_retried) {
     const fresh = await bearer(url, { env: process.env, force: true });
-    if (fresh && fresh !== key) return api(path, { method, body, url, key: fresh, _retried: true });
+    if (fresh && fresh !== key) return api(path, { method, body, url, key: fresh, hint, _retried: true });
   }
   const d = await res.json().catch(() => ({}));
-  if (res.status === 401) fail('尚未登入或登入已過期。先跑：banaverse login');
-  if (!res.ok) fail(`HTTP ${res.status}：${d.error ?? '未知錯誤'}`);
+  if (res.status === 401) fail(`尚未登入或登入已過期。先跑：banaverse login${hint}`);
+  if (!res.ok) fail(`HTTP ${res.status}：${d.error ?? '未知錯誤'}${hint}`);
   return d;
 }
 
-function fail(msg) { console.error('✗ ' + msg); process.exit(1); }
+// 失敗時不呼叫 process.exit：Windows 上的 Node 24 在 fetch 的連線還沒收完時 exit，
+// 會撞 libuv 的 assertion（UV_HANDLE_CLOSING）而以 127 結束、多印一行看不懂的錯。
+// 改成丟一個記號錯誤一路退回 main()，設好 exitCode 讓行程自然結束。
+class Exit extends Error {}
+function fail(msg) { console.error('✗ ' + msg); process.exitCode = 1; throw new Exit(msg); }
 async function ask(q) {
   const rl = createInterface({ input: stdin, output: stdout });
   const a = await rl.question(q);
@@ -208,115 +219,178 @@ async function cmdWhoami(flags) {
 }
 
 async function cmdModels(flags) {
-  const { url } = await resolved(flags);
-  const d = await api('/api/v1/models', { url });
-  const row = (m) => `  ${m.default ? '★' : ' '} ${m.id.padEnd(32)} ${m.label.padEnd(18)} ${m.credits} 點`;
-  const imgs = d.models.filter((m) => m.kind !== 'video');
-  const vids = d.models.filter((m) => m.kind === 'video');
-  console.log('圖片模型（售價／次）：');
-  for (const m of imgs) console.log(row(m));
-  if (vids.length) {
-    console.log('\n影片模型（售價／次，生成約 1–5 分鐘）：');
-    for (const m of vids) console.log(row(m));
-    console.log('\n  影片用：banaverse generate "…" --video');
+  // 帶憑證查（有的話）：清單才會標出這個帳號哪些模型沒開通；沒登入照樣能看公開價目。
+  const { url, key } = await resolved(flags);
+  const d = await api('/api/v1/models', { url, key });
+  const idW = Math.max(...d.models.map((m) => m.id.length)) + 2;
+  const labelW = Math.max(...d.models.map((m) => m.label.length)) + 2;
+  for (const g of groupModels(d.models)) {
+    const cli = g.kind === 'image' ? '' : g.kind === 'video' ? '（加 --video）' : '（CLI 不生成，請用 MCP 或 API）';
+    console.log(`${g.title}${/[A-Za-z0-9]$/.test(g.title) ? ' ' : ''}模型${cli}——${g.unit}：`);
+    for (const m of g.models) {
+      console.log(`  ${m.default ? '★' : ' '} ${m.id.padEnd(idW)}${m.label.padEnd(labelW)}${priceLabel(m)}${lockedMark(m)}`);
+    }
+    console.log('');
   }
-  console.log('  （★＝預設；用 --model <id> 指定其他）');
+  console.log('  ★＝該類預設；用 --model <id> 指定其他。點數為伺服器即時售價，實扣以生成回應為準。');
 }
+
+// 只有這兩類能從終端機生成；其餘（音訊、3D）在確認與扣點之前就擋下，並指出該去哪裡。
+// 守門用「只放行」而不是「只擋影片」：先前指定音訊／3D 模型時 CLI 會先報價、問要不要繼續，
+// 按了 y 才被伺服器回一句「未知或不支援的圖片模型」，跟使用者選的東西對不上。
+const CLI_KINDS = new Set(['image', 'video']);
 
 async function cmdGenerate(pos, flags) {
   const { url, key } = await resolved(flags);
   if (!key) fail('尚未登入。先跑：banaverse login');
   const prompt = pos.join(' ').trim();
   if (!prompt) fail('缺少提示。用法：banaverse generate "一隻賽博龐克貓" [--video] [--model …] [--out cat.png] [--yes]');
+  if (flags.seconds !== undefined && !(Number(flags.seconds) > 0)) fail(`--seconds 要是正數（收到：${flags.seconds}）。`);
 
-  // --video，或 --model 指到影片模型 → 走影片（非同步長任務）
-  const catalog = await api('/api/v1/models', { url });
-  const wantVideo = !!flags.video || catalog.models.some((m) => m.id === flags.model && m.kind === 'video');
-  const chosen = flags.model || catalog.models.find((m) => m.default && (wantVideo ? m.kind === 'video' : m.kind !== 'video'))?.id;
-  const info = catalog.models.find((m) => m.id === chosen);
-  if (!info) fail(`未知模型：${chosen}。可用：${catalog.models.map((m) => m.id).join(', ')}`);
+  // 查型錄（帶憑證才知道 available）：--video，或 --model 指到影片模型 → 走影片（非同步長任務）
+  const catalog = await api('/api/v1/models', { url, key });
+  const usable = catalog.models.filter((m) => CLI_KINDS.has(m.kind));
+  const picked = flags.model ? catalog.models.find((m) => m.id === flags.model) : null;
+  if (flags.model && !picked) fail(`未知模型：${flags.model}。可用：${usable.map((m) => m.id).join(', ')}`);
+  const wantVideo = !!flags.video || picked?.kind === 'video';
+  // 只挑同類的預設——清單裡圖、影各有一顆★，靠排序撿第一顆是脆弱依賴
+  const info = picked || catalog.models.find((m) => m.default && m.kind === (wantVideo ? 'video' : 'image'));
+  if (!info) fail('伺服器沒有標出預設模型。用 --model <id> 指定（見 banaverse models）。');
+  if (!CLI_KINDS.has(info.kind)) {
+    fail(`${info.id} 是${KIND_ZH[info.kind] || info.kind}模型——CLI generate 只做圖片與影片。音訊、3D 請用 MCP（banaverse-mcp）或 API（${url}/api-docs）。`);
+  }
+  if (flags.video && info.kind !== 'video') fail(`--video 搭配的 ${info.id} 是圖片模型。拿掉 --video 生圖，或換一個影片模型（見 banaverse models）。`);
+  if (info.available === false) fail(`這個帳號沒有開通 ${info.label}（${info.id}）。換一個模型（banaverse models 標「未開通」的都不能用）。`);
 
   // 參考圖先讀進來：路徑打錯就在問使用者之前失敗，不會確認完、扣了點才發現檔案不存在。
   const refs = readRefs(flags);
+  const isVideo = info.kind === 'video';
+  const action = isVideo
+    ? (refs.length ? `用 ${refs.length} 張參考圖生成影片` : '生成影片')
+    : (refs.length ? `改圖（${refs.length} 張參考圖）` : '生成');
+  // 圖片報的是實扣（prices 與伺服器扣點同一條算式）；影片只能報基準售價，理由見 lib/catalog.mjs。
+  const cost = isVideo
+    ? `基準售價 ${info.credits} 點（一份的價錢，實扣依秒數與解析度；送出後會印出實扣）`
+    : `將花 ${imageQuote(info, flags.size, refs.length > 0)} 點`;
 
-  // 生成前確認（花點數）：--yes 跳過；互動終端問 y/N；非互動（agent/pipe）要求 --yes
-  if (!flags.yes) {
+  // 生成前確認（花點數）：--yes 跳過；互動終端問 y/N；非互動（agent/pipe）要求 --yes。
+  // 免費模型（本地版）不必問：這道確認是為了「花點數」。
+  if (!flags.yes && !info.free) {
     if (stdin.isTTY && stdout.isTTY) {
-      const a = await ask(`用 ${info.label}（${chosen}）生成，將花 ${info.credits} 點。繼續？[y/N] `);
+      const a = await ask(`用 ${info.label}（${info.id}）${action}，${cost}。繼續？[y/N] `);
       if (!/^y(es)?$/i.test(a)) { console.log('已取消。'); return; }
     } else {
-      fail(`這會花 ${info.credits} 點（${info.label}）。確認後加 --yes 再跑（或先 banaverse models 看價格）。`);
+      fail(`用 ${info.label}（${info.id}）${action}，${cost}。確認後加 --yes 再跑（或先 banaverse models 看價格）。`);
     }
   }
 
-  if (info.kind === 'video') return await generateVideo({ url, key, prompt, chosen, info, flags, refs });
+  if (isVideo) return await generateVideo({ url, key, prompt, info, flags, refs });
 
   process.stderr.write(`⏳ 生成中（${info.label}）…\n`);
-  const r = await api('/api/v1/generate', {
+  let r = await api('/api/v1/generate', {
     method: 'POST', url, key,
-    body: { prompt, model: chosen, aspectRatio: flags.aspect, imageSize: flags.size, refs: refs.length ? refs : undefined },
+    body: { prompt, model: info.id, aspectRatio: flags.aspect, imageSize: flags.size, refs: refs.length ? refs : undefined },
   });
-  if (!r.dataUrl) fail('沒有拿到影像。');
-
-  // data:image/…;base64,… → 存檔
-  const m = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i.exec(r.dataUrl);
-  const ext = m ? (m[1].split('/')[1] || 'png').replace('jpeg', 'jpg') : 'png';
-  const b64 = m ? m[2] : r.dataUrl.split(',')[1] || '';
-  const out = pathResolve(flags.out || `banaverse-${stamp()}.${ext}`);
-  writeFileSync(out, Buffer.from(b64, 'base64'));
-  console.log(`✓ 生成完成（花 ${r.credits} 點）→ ${out}`);
+  // 自有機台的圖片（Banaverse Image）排隊太久時，伺服器回 async＋jobId（點已扣、工單在跑）。
+  // 在這裡接著取件，**不要重送**——重送會再生成一次、再扣一次點。
+  if (r.async && r.jobId) {
+    process.stderr.write(`⏳ 機台排隊中（點數已扣，不要重跑 generate）。中途離開可用這個 jobId 取回：\n   ${r.jobId}\n`);
+    const j = await waitJob({ url, key, jobId: r.jobId, everyMs: 5000 });
+    if (!j) return;
+    r = { ...j, credits: j.credits ?? r.credits };
+  }
+  const out = await saveResult(r, flags.out);
+  console.log(`✓ 生成完成（${spent(r.credits)}）→ ${out}`);
 }
 
 // 影片是長任務：POST 只拿到 jobId，要輪詢 /api/v1/jobs/{id} 直到 done。
-// 伺服器完成後會把影片放上 Cloud Storage 並回公開網址，這裡直接抓那個網址存檔。
-async function generateVideo({ url, key, prompt, chosen, info, flags, refs = [] }) {
+// 伺服器完成後會把影片放上 Cloud Storage 並回公開網址，這裡抓那個網址存檔。
+async function generateVideo({ url, key, prompt, info, flags, refs = [] }) {
   const sub = await api('/api/v1/generate', {
     method: 'POST', url, key,
     body: {
-      kind: 'video', prompt, model: chosen, aspectRatio: flags.aspect,
+      kind: 'video', prompt, model: info.id, aspectRatio: flags.aspect,
       durationSec: flags.seconds ? Number(flags.seconds) : undefined,
       refs: refs.length ? refs : undefined,
     },
   });
   if (!sub.jobId) fail('沒有拿到 jobId。');
-  process.stderr.write(`⏳ 影片生成中（${info.label}）…通常 1–5 分鐘，可按 Ctrl+C 離開，之後用 jobId 再取：\n   ${sub.jobId}\n`);
+  // 確認時只報得出基準售價，這裡把伺服器實際扣的講出來。
+  process.stderr.write(`⏳ 影片生成中（${info.label}，${sub.credits ? `已扣 ${sub.credits} 點，失敗會在取件時退點` : '未扣點'}）…`
+    + `通常 1–5 分鐘，可按 Ctrl+C 離開，之後用 jobId 再取：\n   ${sub.jobId}\n`);
+  const j = await waitJob({ url, key, jobId: sub.jobId, everyMs: 10000 });
+  if (!j) return;
+  const out = await saveResult(j, flags.out);
+  console.log(`✓ 影片完成（${spent(j.credits ?? sub.credits)}）→ ${out}`);
+}
 
+/** 輪詢到完成，回完成的工單；超過本地等待上限回 null（已印出取件指令）。
+ *  停止等待不會取消工單——所以上限到了是把 jobId 交回去，不是報錯。 */
+async function waitJob({ url, key, jobId, everyMs, limitMs = 15 * 60 * 1000 }) {
+  const hint = `\n  工單沒有取消。稍後可用 banaverse job ${jobId} 再查；不要重跑 generate（會再扣一次點）。`;
   const started = Date.now();
-  const LIMIT_MS = 15 * 60 * 1000; // 15 分鐘還沒好就把 jobId 留給使用者自己取，不要無限掛著
   for (;;) {
-    await new Promise((r) => setTimeout(r, 10000));
-    const j = await api(`/api/v1/jobs/${encodeURIComponent(sub.jobId)}`, { url, key });
-    if (j.done) {
-      if (!j.url) fail('影片完成但沒有網址。');
-      const res = await fetch(j.url);
-      if (!res.ok) fail(`影片下載失敗：HTTP ${res.status}`);
-      const out = pathResolve(flags.out || `banaverse-${stamp()}.mp4`);
-      writeFileSync(out, Buffer.from(await res.arrayBuffer()));
-      console.log(`✓ 影片完成（花 ${j.credits} 點）→ ${out}`);
-      return;
-    }
+    await new Promise((r) => setTimeout(r, everyMs));
+    const j = await api(`/api/v1/jobs/${encodeURIComponent(jobId)}`, { url, key, hint });
+    if (j.done) { process.stderr.write('\n'); return j; }
     process.stderr.write(`   …${Math.round((j.progress || 0) * 100)}%\r`);
-    if (Date.now() - started > LIMIT_MS) {
-      console.log(`\n仍在生成中。稍後用這個 jobId 取件：\n  banaverse job ${sub.jobId}`);
-      return;
+    if (Date.now() - started > limitMs) {
+      console.log(`\n仍在生成中。稍後用這個 jobId 取件：\n  banaverse job ${jobId}`);
+      return null;
     }
   }
 }
 
-/** 取件既有的影片工單（generate 中途離開後用）。 */
+/** 取件既有的工單：影片、排隊太久的自有機台圖片，或從 MCP／API 送出的 3D。 */
 async function cmdJob(pos, flags) {
   const { url, key } = await resolved(flags);
   if (!key) fail('尚未登入。先跑：banaverse login');
   const jobId = pos.join(' ').trim();
-  if (!jobId) fail('用法：banaverse job <jobId>');
+  if (!jobId) fail('用法：banaverse job <jobId> [--out <檔名>]');
   const j = await api(`/api/v1/jobs/${encodeURIComponent(jobId)}`, { url, key });
   if (!j.done) { console.log(`還在生成中（${Math.round((j.progress || 0) * 100)}%）。稍後再試。`); return; }
-  if (!j.url) fail('影片完成但沒有網址。');
-  const res = await fetch(j.url);
-  if (!res.ok) fail(`影片下載失敗：HTTP ${res.status}`);
-  const out = pathResolve(flags.out || `banaverse-${stamp()}.mp4`);
-  writeFileSync(out, Buffer.from(await res.arrayBuffer()));
-  console.log(`✓ 影片完成（花 ${j.credits} 點）→ ${out}`);
+  const out = await saveResult(j, flags.out);
+  console.log(`✓ ${KIND_ZH[j.kind] || ''}完成（${spent(j.credits)}）→ ${out}`);
+}
+
+const spent = (c) => (c ? `花 ${c} 點` : '未扣點');
+
+// 副檔名照實際內容決定，不照種類寫死：3D 依模型可能是 GLB，也可能是含 OBJ／材質的 ZIP，
+// 一律存成 .glb 的話，ZIP 會打不開而且看不出原因。
+const EXT_OF_TYPE = {
+  'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif',
+  'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov',
+  'model/gltf-binary': 'glb', 'application/zip': 'zip', 'application/x-zip-compressed': 'zip',
+  'audio/mpeg': 'mp3', 'audio/wav': 'wav', 'audio/x-wav': 'wav',
+};
+const FALLBACK_EXT = { image: 'png', video: 'mp4', audio: 'mp3' }; // 3D 猜不出就不猜（.bin），理由同上
+
+/** 把生成結果寫到檔案，回寫入的路徑。有 dataUrl 就直接用（同一份位元組，省一次下載）；
+ *  取件回來的常常只有網址（dataUrl 是空字串），那就下載它。 */
+async function saveResult(r, outFlag) {
+  let bytes, ext;
+  const m = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+);base64,(.+)$/i.exec(r.dataUrl || '');
+  if (m) {
+    ext = EXT_OF_TYPE[m[1].toLowerCase()];
+    bytes = Buffer.from(m[2], 'base64');
+  } else if (r.url) {
+    const res = await fetch(r.url).catch((e) => fail(`下載失敗（${e.message}）：${r.url}`));
+    if (!res.ok) fail(`下載失敗（HTTP ${res.status}）：${r.url}`);
+    ext = EXT_OF_TYPE[(res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase()] || extOfUrl(r.url);
+    bytes = Buffer.from(await res.arrayBuffer());
+  } else {
+    fail('完成了但沒有拿到檔案（沒有網址也沒有內容）。');
+  }
+  const out = pathResolve(outFlag || `banaverse-${stamp()}.${ext || FALLBACK_EXT[r.kind] || 'bin'}`);
+  writeFileSync(out, bytes);
+  return out;
+}
+function extOfUrl(u) {
+  try {
+    const name = decodeURIComponent(new URL(u).pathname).split('/').pop() || '';
+    const ext = name.includes('.') ? name.split('.').pop().toLowerCase() : '';
+    return /^[a-z0-9]{2,5}$/.test(ext) ? ext : '';
+  } catch { return ''; }
 }
 
 function stamp() {
@@ -330,25 +404,32 @@ const HELP = `banaverse — Banaverse 生成 CLI（文字生成圖片／影片�
 用法：
   banaverse login [--url <base>]                   瀏覽器登入（開瀏覽器授權，免貼金鑰）
   banaverse whoami                                  帳號與點數餘額
-  banaverse models                                  可用圖片／影片模型與售價
+  banaverse models                                  可用模型與即時售價（圖片／影片／音訊／3D）
   banaverse generate "<提示>" [選項]                 生成圖片（加 --video 生成影片；加 --ref 用參考圖）
-  banaverse job <jobId>                             取回先前送出的影片
+  banaverse job <jobId> [--out <檔名>]              取回先前送出的影片、排隊中的圖片或 3D
   banaverse logout                                  清除本機設定
 
 generate 選項：
   --video          生成影片（長任務，會自動輪詢到完成；預設 Veo 3.1 Lite）
-  --ref <檔案>     參考圖：圖生圖／圖生影片。可重複給多張（--ref a.png --ref b.png）。
+  --ref <檔案>     參考圖：圖生圖／圖生影片。可重複給多張（--ref a.png --ref b.png），上限依模型。
                    吃本機檔案路徑（png/jpg/webp/gif），也接受 data URL 或 Banaverse 回傳的網址。
-                   影片：Veo 一張＝首幀動畫化；Seedance／Omni 一律當參考圖。
+                   影片：只有 Veo 3.1 Lite（預設）拿第一張當首幀；其他模型一律當參考圖，
+                   其中 Veo 3.1／Fast 掛參考圖時固定 8 秒、照 8 秒扣點。
   --model <id>     指定模型（預設＝Nano Banana 2 Lite；影片預設 Veo 3.1 Lite）
-  --aspect <比例>  1:1 / 16:9 / 9:16 …（圖片預設 1:1、影片 16:9）
-  --size <解析度>  512 / 1K / 2K / 4K（預設 1K，僅圖片）
+  --aspect <比例>  1:1 / 16:9 / 9:16 …（不給＝模型預設：Nano Banana 系文生圖 16:9、改圖沿用參考圖比例；
+                   Seedream 與 Banaverse Image 1:1；影片 16:9）
+  --size <解析度>  512px / 1K / 2K / 4K（僅圖片；可用值與預設依模型，例：Nano Banana 2 Lite 只有 1K、
+                   Pro 預設 2K。解析度影響售價）
   --seconds <秒>   影片長度（依模型支援範圍）
-  --out <檔名>     輸出檔（預設 banaverse-<時間>.png ／ .mp4）
+  --out <檔名>     輸出檔（預設 banaverse-<時間>.<依檔案類型>）
   --yes            跳過「花 N 點」確認（agent 請先向使用者確認再帶此旗標）
 
-影片會花較多點數（Veo Lite 100 點起），且需 1–5 分鐘。中途 Ctrl+C 離開後，
-可用印出來的 jobId 跑 banaverse job <jobId> 取回。
+售價以 banaverse models 為準（伺服器即時算）。圖片依解析度與是否改圖，確認時報的就是實扣；
+影片列的是一份的基準售價，實扣依秒數與解析度，送出後會印出實扣。各模型的可用值見
+https://banaverse.thepocket.company/api-docs 的「模型參考」。
+
+影片需 1–5 分鐘。中途 Ctrl+C 離開後，可用印出來的 jobId 跑 banaverse job <jobId> 取回；
+不要重跑 generate，那會再扣一次點。音訊與 3D 不在 CLI，請用 MCP（banaverse-mcp）或 API。
 
 登入：banaverse login 會開瀏覽器授權，登入後自動續期（不用手動貼金鑰）。
 進階：也可 --key <bnv_…> 直接帶金鑰，或用環境變數 BANAVERSE_API_KEY / BANAVERSE_URL。`;
@@ -367,8 +448,12 @@ async function main() {
     case 'generate': case 'gen': return cmdGenerate(pos, flags);
     case 'job': return cmdJob(pos, flags);
     case undefined: case 'help': case '--help': case '-h': console.log(HELP); return;
-    default: console.error(`未知指令：${cmd}\n`); console.log(HELP); process.exit(1);
+    default: console.error(`未知指令：${cmd}\n`); console.log(HELP); process.exitCode = 1;
   }
 }
 
-main().catch((e) => fail(String(e?.message ?? e)));
+main().catch((e) => {
+  if (e instanceof Exit) return; // 已印過訊息
+  console.error('✗ ' + String(e?.message ?? e));
+  process.exitCode = 1;
+});

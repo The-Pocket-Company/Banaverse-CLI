@@ -72,6 +72,11 @@ video support, and is marked private — running it gives behaviour that does no
 
    Find the chosen model's price, then **tell the user explicitly**: "This will use <model>, costing N credits (balance M). Generate?" — and wait for a yes. Do **not** generate without explicit consent.
 
+   Prices come from the server and change — always read them from `banaverse models`, never from memory or
+   from this file. Image prices depend on resolution (and, for some models, on whether it is an edit), so
+   `models` shows a range. For the exact figure, run the same `generate` command **without** `--yes`: in a
+   non-interactive shell it prints the exact charge and stops without spending anything.
+
 3. **Generate** (only after the user agrees — that is when you may pass `--yes`):
 
    ```bash
@@ -79,15 +84,23 @@ video support, and is marked private — running it gives behaviour that does no
    ```
 
    - Turn the user's request into a clear, specific prompt (subject, style, composition, lighting).
-   - Add `--aspect` (`1:1` / `16:9` / `9:16`) and `--size` (`512` / `1K` / `2K` / `4K`) as needed.
-   - No model specified → the default (cheapest, Nano Banana 2 Lite) is used.
+   - Add `--aspect` (`1:1` / `16:9` / `9:16` …) and `--size` (`512px` / `1K` / `2K` / `4K`) as needed. Values depend on
+     the model (Nano Banana 2 Lite only does 1K). Leave them out to get the model's default: Nano Banana
+     text-to-image is 16:9 and edits keep the reference's ratio; Seedream and Banaverse Image are 1:1;
+     Nano Banana Pro defaults to 2K. Size changes the price.
+   - No model specified → the default, Nano Banana 2 Lite, is used.
+   - Some image models (Banaverse Image) run on Banaverse's own GPUs and can queue. The command keeps
+     polling; if it stops and prints a `jobId`, retrieve with `banaverse job <jobId>` — never re-run
+     `generate`, that charges again.
 
 4. **Report the result**: print the saved file path and confirm the charge via the balance change. On failure (402 insufficient credits / 502 generation failed), relay the error verbatim; failed generations are auto‑refunded.
 
 ## Video
 
-Same flow, plus `--video`. Video is a **long job** (1–5 minutes) and costs far more than an image
-(Veo 3.1 Lite is 100 credits vs 5 for the cheapest image) — **the cost confirmation matters even more here**.
+Same flow, plus `--video`. Video is a **long job** (1–5 minutes) and costs far more than an image —
+**the cost confirmation matters even more here**. `banaverse models` lists each video model's base price
+for one unit (e.g. 8 seconds at 720p); the actual charge scales with length and resolution, and the CLI
+prints the amount actually charged right after submitting. Tell the user it is a base price.
 
 ```bash
 banaverse generate "<a clear, specific prompt>" --video --aspect 16:9 --seconds 4 --out clip.mp4 --yes
@@ -107,8 +120,8 @@ before exiting, so you get a completion notification and can report back then.
 Tell the user "submitted, ~N minutes, I'll let you know" and **carry on with other work** —
 do not sit and wait.
 
-Do **not** use the MCP route (`banaverse_generate_video` + repeated `banaverse_get_video`) for
-long video jobs. MCP tools are synchronous, so polling that way blocks the conversation and burns
+Do **not** use the MCP route (`banaverse_generate_video` + repeated `banaverse_get_video`, or
+`banaverse_get_job` on the bundled `banaverse-mcp` server) for long video jobs. MCP tools are synchronous, so polling that way blocks the conversation and burns
 tokens on every check. MCP suits "the user just wants a URL and is happy to wait"; use the CLI
 when it should run in the background.
 
@@ -124,8 +137,10 @@ banaverse generate "have him turn to camera, slow push in" --ref photo.jpg --vid
 - Takes local file paths (png/jpg/webp/gif), plus data URLs and URLs Banaverse itself returned.
 - **Other sites' image URLs are rejected** (the server only trusts its own storage, for SSRF safety) —
   download the image locally first, then `--ref` it.
-- Video: one reference on Veo animates it as the first frame; Veo 3.1/Fast with several switches to
-  reference images; Seedance/Omni always treat them as reference images.
+- Video: only Veo 3.1 Lite (the default) uses the first image as the **first frame**. Every other model
+  treats refs as style / subject references, not a first frame — Veo 3.1 and Veo 3.1 Fast included, and
+  with refs those two are fixed at 8 seconds (charged as 8 seconds). To make a picture move on those
+  models, describe the motion in the prompt.
 - If the chosen model can't take references, the call fails with a 400 explaining why — it will
   **not** silently ignore them and still charge.
 
@@ -135,10 +150,16 @@ of the whole picture.
 ## MCP alternative
 
 The same account also exposes an MCP server at `https://banaverse.thepocket.company/api/mcp`
-(tools: `banaverse_generate_image`, `banaverse_generate_video` + `banaverse_get_video`,
-`banaverse_list_models`, `banaverse_get_balance`). If those tools are already available in this
-session, prefer them — no install needed. The CLI is the better choice when the user wants the
-file written to disk, since MCP returns a URL rather than a local file.
+(tools include `banaverse_generate_image` + `banaverse_get_image`, `banaverse_generate_video` +
+`banaverse_get_video`, `banaverse_generate_audio`, `banaverse_generate_3d` + `banaverse_get_3d`,
+`banaverse_list_models`, `banaverse_get_balance`). This package also ships a local stdio server,
+`banaverse-mcp`, with the same generate tools and a single `banaverse_get_job` for retrieval.
+If those tools are already available in this session, prefer them — no install needed. The CLI is the
+better choice when the user wants the file written to disk, since MCP returns a URL rather than a local file.
+
+**Audio and 3D are MCP / API only** — `banaverse generate` does images and video. For music, speech or a
+3D model, use `banaverse_generate_audio` / `banaverse_generate_3d` (both need an explicit `model`; speech
+is priced by length; 3D comes back as GLB or a ZIP with OBJ and materials, depending on the model).
 
 ## Hard rules
 

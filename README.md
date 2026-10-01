@@ -4,7 +4,7 @@
 
 - 🖼️ **Text‑to‑image** from the command line — `banaverse generate "…"`
 - 🎬 **Text‑to‑video** — `banaverse generate "…" --video` (Veo; long job, polls and saves the .mp4 for you)
-- 🔌 **MCP server** — connect Banaverse to Claude Desktop / Claude Code / any MCP client
+- 🔌 **MCP server** — connect Banaverse to Claude Desktop / Claude Code / any MCP client (images, video, audio and 3D)
 - 🤖 **Agent‑ready** — a bundled skill teaches coding agents to drive the CLI safely
 - 🔑 **One sign‑in** — browser OAuth; no API keys to copy or paste
 - 📦 **Zero dependencies** — single Node ≥ 18 files, nothing to build
@@ -35,9 +35,9 @@ banaverse generate "a duck bobbing on calm water" --video   # 影片（長任務
 |---|---|
 | `banaverse login` | Browser sign‑in (OAuth). Advanced: `--key <bnv_…>` to use an existing key. |
 | `banaverse whoami` | Show the signed‑in account and credit balance. |
-| `banaverse models` | List available image and video models with their prices. |
-| `banaverse generate "<prompt>"` | Generate an image — add `--video` for video. Confirms the cost first (skip with `--yes`). |
-| `banaverse job <jobId>` | Retrieve a video you submitted earlier (if you interrupted `generate`). |
+| `banaverse models` | List available models (image, video, audio, 3D) with live prices from the server. |
+| `banaverse generate "<prompt>"` | Generate an image — add `--video` for video, `--ref` to start from an image. Confirms the cost first (skip with `--yes`). |
+| `banaverse job <jobId>` | Retrieve a job submitted earlier: a video you interrupted, a queued image, or a 3D model submitted via MCP / API. |
 | `banaverse logout` | Remove the local config. |
 
 ### `generate` options
@@ -45,12 +45,17 @@ banaverse generate "a duck bobbing on calm water" --video   # 影片（長任務
 | Flag | Meaning | Default |
 |---|---|---|
 | `--video` | Generate video instead of an image (long job, 1–5 min) | off |
-| `--model <id>` | Model to use (see `banaverse models`) | cheapest (Nano Banana 2 Lite / Veo 3.1 Lite) |
-| `--aspect <ratio>` | `1:1` / `16:9` / `9:16` … | `1:1` |
-| `--size <res>` | `512` / `1K` / `2K` / `4K` (images only) | `1K` |
+| `--ref <file>` | Reference image (image‑to‑image / image‑to‑video). Repeat for several; the limit depends on the model. Local png/jpg/webp/gif, a data URL, or a URL Banaverse returned. For video, only Veo 3.1 Lite uses the first image as the first frame; other models treat refs as references, and Veo 3.1 / Fast with refs are fixed at 8 s (charged as 8 s). | none |
+| `--model <id>` | Model to use (see `banaverse models`) | Nano Banana 2 Lite / Veo 3.1 Lite |
+| `--aspect <ratio>` | `1:1` / `16:9` / `9:16` … (values per model) | model default: Nano Banana text‑to‑image 16:9, edits keep the source ratio; Seedream and Banaverse Image 1:1; video 16:9 |
+| `--size <res>` | `512px` / `1K` / `2K` / `4K` (images only; values per model, affects the price) | model default (e.g. 1K; Nano Banana Pro 2K) |
 | `--seconds <n>` | Video length (per model limits) | model default |
-| `--out <file>` | Output path | `banaverse-<timestamp>.png` / `.mp4` |
+| `--out <file>` | Output path | `banaverse-<timestamp>.<ext>` (extension from the file type) |
 | `--yes` | Skip the "spend N credits?" confirmation | interactive prompt |
+
+Prices are never hard‑coded here — `banaverse models` shows the server's live prices. For images the confirmation quotes the exact charge for that resolution and edit/no‑edit; for video it shows the base price for one unit (the actual charge depends on length and resolution and is printed right after submitting). Allowed values per model: [API docs → model reference](https://banaverse.thepocket.company/api-docs).
+
+Some image models run on Banaverse's own GPUs and can queue. If the queue is long the CLI keeps polling for you; if you stop it, retrieve the image later with `banaverse job <jobId>` — don't re‑run `generate`, that charges again. Audio and 3D are available through MCP and the API, not `generate`.
 
 ## Use it from your AI tools
 
@@ -68,7 +73,7 @@ After `npm install -g @banaverse/cli`, register the bundled MCP server. Example 
 }
 ```
 
-It exposes `banaverse_generate_image`, `banaverse_generate_video` + `banaverse_get_video`, `banaverse_list_models`, `banaverse_get_balance` — and authenticates with the key from `banaverse login` (or `BANAVERSE_API_KEY`).
+It exposes `banaverse_generate_image`, `banaverse_generate_video`, `banaverse_generate_audio`, `banaverse_generate_3d`, `banaverse_get_job` (retrieves video, 3D, and queued images), `banaverse_list_models`, `banaverse_get_balance` — and reuses the `banaverse login` sign‑in (or `BANAVERSE_API_KEY`).
 
 > Prefer a hosted, no‑install option? The Banaverse web app also offers a **remote MCP connector** (paste a URL, sign in with Google) — see the **MCP & CLI** panel in your account menu on [banaverse.thepocket.company](https://banaverse.thepocket.company).
 
@@ -78,7 +83,7 @@ This package ships a skill at [`skills/banaverse/SKILL.md`](skills/banaverse/SKI
 
 ## CI / headless
 
-No browser available? Mint a key in the app and pass it via environment variables:
+No browser available? Create a key in the app (account menu → **API 金鑰**) and pass it via environment variables:
 
 ```bash
 export BANAVERSE_API_KEY=bnv_xxx
@@ -88,7 +93,7 @@ banaverse generate "…" --yes
 
 ## Auth & safety
 
-- Browser sign‑in stores short‑lived OAuth tokens (access 1 h, refresh 30 d, rotated on every refresh) in `~/.banaverse/config.json`; `banaverse logout` deletes them. Revoking the connector on the website invalidates them immediately.
+- Browser sign‑in stores short‑lived OAuth tokens (access 1 h, refresh 30 d, rotated on every refresh) in `~/.banaverse/config.json`; `banaverse logout` deletes them from this machine. Logging out does not revoke them on the server; an unused refresh token lapses after 30 days.
 - API keys (`bnv_…`, for CI or `--key`) are stored **server‑side as SHA‑256 hashes** and revocable at any time; the CLI never prints your key.
 - `generate` **confirms the credit cost first**. In non‑interactive contexts (pipes, agents) it refuses to spend until you pass `--yes`, so an agent must get your OK before charging.
 
