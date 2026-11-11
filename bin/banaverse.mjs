@@ -5,6 +5,8 @@
 //   banaverse whoami            顯示帳號與點數餘額
 //   banaverse models            列出可用模型與即時售價（圖片／影片／音訊／3D）
 //   banaverse generate "<提示>"   生成圖片；--video 生成影片（預設先顯示花費並確認；--yes 跳過）
+//   banaverse tools             列出工具（白背景、試穿、多尺寸…）
+//   banaverse tool <代號>        用工具處理圖片：prompt、模型、比例是 Banaverse 調好的，你只給圖（與一句答案）
 //   banaverse job <jobId>       取回先前送出的影片、排隊中的圖片或 3D
 //   banaverse logout            清除本機設定
 //
@@ -20,11 +22,12 @@
 // 相依：零（Node 18+ 內建 fetch / readline / http / crypto）。
 // 專案：https://github.com/The-Pocket-Company/Banaverse-CLI
 // ============================================================================
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { resolve as pathResolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { CFG_FILE, DEFAULT_URL, loadCfg, saveCfg, clearCfg, bearer } from '../lib/auth.mjs';
 import { groupModels, priceLabel, imageQuote, lockedMark, KIND_ZH } from '../lib/catalog.mjs';
+import { isRemote, localImage } from '../lib/refs.mjs';
 import { createServer } from 'node:http';
 import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -45,7 +48,7 @@ async function resolved(flags) {
 // 教訓（2026-07-29 實測）：舊版把未知旗標默默當布林，`--ref a.png` 在還沒有 --ref 的版本上
 // 被吞掉、a.png 變成提示詞的一部分，八次生成 40 點全變成無參考的錯圖，全程零錯誤訊息。
 // 拼錯參數的代價不能是「扣了點才發現」。
-const VALUE_FLAGS = new Set(['url', 'key', 'model', 'aspect', 'size', 'out', 'label', 'seconds', 'ref']);
+const VALUE_FLAGS = new Set(['url', 'key', 'model', 'aspect', 'size', 'out', 'label', 'seconds', 'ref', 'answer']);
 const REPEATABLE = new Set(['ref']); // 可重複給的旗標 → 收成陣列（多張參考圖）
 const BOOL_FLAGS = new Set(['yes', 'video', 'help', 'h']);
 function parse(argv) {
@@ -71,20 +74,17 @@ function parse(argv) {
   return { pos, flags };
 }
 
-// --ref：本機檔案路徑 → data URL；已經是 data:/https: 就原樣送。
+// --ref：本機檔案路徑 → data URL（lib/refs.mjs，本機 MCP 共用）；已經是 data:/https: 就原樣送。
 // 伺服器端只收 data URL、base64、或 Banaverse 自己回傳的網址（防 SSRF），
 // 所以外部圖片網址在這裡就會被伺服器擋成 400，不會白扣點。
-const REF_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' };
 function readRefs(flags) {
   const list = Array.isArray(flags.ref) ? flags.ref : flags.ref ? [flags.ref] : [];
   return list.map((r) => {
-    if (/^(data:|https?:)/i.test(r)) return r;
-    const p = pathResolve(r);
-    if (!existsSync(p)) fail(`找不到參考圖：${r}`);
-    const ext = (p.split('.').pop() || '').toLowerCase();
-    const mime = REF_MIME[ext];
-    if (!mime) fail(`參考圖格式不支援：${r}（支援 png / jpg / webp / gif）`);
-    return `data:${mime};base64,${readFileSync(p).toString('base64')}`;
+    if (isRemote(r)) return r;
+    let data;
+    try { data = localImage(r); } catch (e) { fail(e.message); }
+    if (!data) fail(`找不到參考圖：${r}`);
+    return data;
   });
 }
 
@@ -303,6 +303,140 @@ async function cmdGenerate(pos, flags) {
   console.log(`✓ 生成完成（${spent(r.credits)}）→ ${out}`);
 }
 
+// ── 工具（白背景、試穿、多尺寸…；型錄在伺服器 /api/v1/tools，跟網頁上的工具同一份）──────────
+// 跟 generate 的差別：prompt、模型與比例由 Banaverse 決定，呼叫端只給圖與一句答案（換背景＝換成什麼）。
+// 為什麼（2026-11-11）：agent 自己寫試穿、白背景的 prompt，好壞看它的功力、每次還不一樣；
+// 工具是調過的那一份，誰叫都拿到一樣的成品，agent 也不必花 token 寫 prompt。
+
+/** 一行講清楚要給什麼：幾張圖（每張是什麼）、--answer 填什麼、出圖還是出影片。 */
+function toolNeeds(t) {
+  const n = t.images.min === t.images.max ? `${t.images.min} 張圖` : `${t.images.min}–${t.images.max} 張圖`;
+  const slots = t.slots ? `：${t.slots.join('、')}` : '';
+  const opts = t.ask?.kind === 'pick' ? t.ask.options.map((o) => o.id) : [];
+  const ask = !t.ask ? '' : t.ask.kind === 'pick'
+    ? `；--answer ${opts.length > 6 ? `${opts.slice(0, 6).join('／')}…` : opts.join('／')}${t.ask.single ? '' : '（可複選）'}`
+    : `；--answer「${t.ask.question}」${t.ask.required ? '' : '（可省略）'}`;
+  return `${n}${slots}${ask}${t.out === 'video' ? '；出影片' : ''}`;
+}
+
+/** 某個工具的完整說明（給錯參數時一起印出來，不必再查一次）。 */
+function toolDetail(t) {
+  const lines = [`${t.id}「${t.label}」：${t.hint}`, `  要給：${toolNeeds(t)}`];
+  if (t.ask?.kind === 'pick') lines.push(`  ${t.ask.question}可填：${t.ask.options.map((o) => o.id).join('、')}（不給＝${t.ask.defaults.join('、')}）`);
+  const refs = t.slots ? t.slots.map((s) => ` --ref ${s}.jpg`).join('') : ' --ref 圖.jpg'.repeat(t.images.min);
+  lines.push(`  例：banaverse tool ${t.id}${refs}${t.ask?.kind === 'text' && t.ask.required ? ' --answer "…"' : ''}`);
+  return lines.join('\n');
+}
+
+async function cmdTools(flags) {
+  const { url } = await resolved(flags);
+  const d = await api('/api/v1/tools', { url });
+  const idW = Math.max(...d.tools.map((t) => t.id.length)) + 2;
+  for (const c of d.categories) {
+    const list = d.tools.filter((t) => t.category === c.id);
+    if (!list.length) continue;
+    console.log(`${c.label}：`);
+    for (const t of list) console.log(`  ${t.id.padEnd(idW)}${t.label}　${t.hint}（${toolNeeds(t)}）`);
+    console.log('');
+  }
+  console.log('用法：banaverse tool <代號> --ref <圖> [--ref <圖>] [--answer "…"]\n例：  banaverse tool tryon --ref 人物.jpg --ref 衣服.jpg');
+}
+
+/** --answer 整理成伺服器要的樣子（規則同伺服器的 toolAnswer）：選項題不給就用預設；文字題必填的沒給就擋。 */
+function toolAnswer(t, raw) {
+  const ask = t.ask;
+  if (!ask) return undefined;
+  if (ask.kind === 'pick') {
+    if (raw === undefined) return ask.defaults;
+    // 單選不切字：選項本身可能有空白（「3D 卡通」）。複選照伺服器的規則用頓號、逗號或空白分。
+    const list = ask.single ? [String(raw).trim()] : String(raw).split(/[、,，\s]+/);
+    const picked = list.map((x) => x.trim()).filter((id) => ask.options.some((o) => o.id === id));
+    if (!picked.length) fail(`「${t.label}」的 --answer 只能填：${ask.options.map((o) => o.id).join('、')}`);
+    return ask.single ? [picked[0]] : [...new Set(picked)];
+  }
+  const text = String(raw ?? '').trim();
+  if (!text && ask.required) fail(`「${t.label}」要先回答：${ask.question}（加 --answer "…"）\n${toolDetail(t)}`);
+  return [text];
+}
+
+const safeName = (s) => String(s).replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, '');
+
+async function cmdTool(pos, flags) {
+  const { url, key } = await resolved(flags);
+  if (!key) fail('尚未登入。先跑：banaverse login');
+  const id = (pos[0] || '').trim();
+  if (!id) fail('用法：banaverse tool <代號> --ref <圖> [--answer "…"]（工具清單：banaverse tools）');
+  const [{ tools }, catalog] = await Promise.all([api('/api/v1/tools', { url }), api('/api/v1/models', { url, key })]);
+  const t = tools.find((x) => x.id === id);
+  if (!t) fail(`沒有「${id}」這個工具。工具清單：banaverse tools`);
+  // 圖、答案、模型都先驗過，才問要不要花點數：不會確認完、扣了點才發現少一張圖。
+  const refs = readRefs(flags);
+  if (refs.length < t.images.min || refs.length > t.images.max) {
+    const n = t.images.min === t.images.max ? `${t.images.min}` : `${t.images.min}–${t.images.max}`;
+    fail(`「${t.label}」要 ${n} 張圖${t.slots ? `（照順序：${t.slots.join('、')}）` : ''}，這次給了 ${refs.length} 張。\n${toolDetail(t)}`);
+  }
+  const answer = toolAnswer(t, flags.answer);
+
+  // 模型：指定就用（要同一類）；沒指定就照工具排的順序，挑第一顆這個帳號開通了的——跟伺服器挑的一樣，報價才對得上。
+  let info;
+  if (flags.model) {
+    info = catalog.models.find((m) => m.id === flags.model);
+    if (!info) fail(`未知模型：${flags.model}。可用：${catalog.models.filter((m) => m.kind === t.out).map((m) => m.id).join(', ')}`);
+    if (info.kind !== t.out) fail(`「${t.label}」做的是${KIND_ZH[t.out]}，--model 要填${KIND_ZH[t.out]}模型（${info.id} 是${KIND_ZH[info.kind] || info.kind}）。`);
+    if (info.available === false) fail(`這個帳號沒有開通 ${info.label}（${info.id}）。`);
+  } else {
+    info = t.models.map((m) => catalog.models.find((x) => x.id === m)).find((m) => m && m.available !== false);
+    if (!info) fail(`這個帳號沒有開通「${t.label}」用得到的模型（${t.models.join('、')}）。`);
+  }
+
+  // 一個工具可能出好幾版（多尺寸一個比例一版、系列圖四版），每一版各扣一次。
+  const versions = t.versions?.perOption ? answer.length : (t.versions?.count || 1);
+  const isVideo = t.out === 'video';
+  const each = isVideo ? info.credits : imageQuote(info, flags.size, true);
+  const cost = isVideo
+    ? `${versions > 1 ? `${versions} 版，` : ''}每版基準售價 ${each} 點（實扣依秒數與解析度；送出後會印出實扣）`
+    : `將花 ${each * versions} 點${versions > 1 ? `（${versions} 版，每版 ${each} 點）` : ''}`;
+  if (!flags.yes && !info.free) {
+    const q = `用「${t.label}」（${info.label}）處理 ${refs.length} 張圖，${cost}。`;
+    if (stdin.isTTY && stdout.isTTY) {
+      const a = await ask(`${q}繼續？[y/N] `);
+      if (!/^y(es)?$/i.test(a)) { console.log('已取消。'); return; }
+    } else {
+      fail(`${q}確認後加 --yes 再跑（或先 banaverse models 看價格）。`);
+    }
+  }
+
+  process.stderr.write(`⏳ ${t.label}中（${info.label}${versions > 1 ? `，${versions} 版` : ''}）…\n`);
+  const r = await api('/api/v1/tools', {
+    method: 'POST', url, key,
+    body: {
+      tool: t.id, answer, images: refs, model: info.id, aspectRatio: flags.aspect, imageSize: flags.size,
+      durationSec: flags.seconds ? Number(flags.seconds) : undefined,
+    },
+  });
+  let saved = 0;
+  const base = `banaverse-${t.id}-${stamp()}`;
+  for (const [i, s] of r.steps.entries()) {
+    const name = r.steps.length > 1 ? s.step : '';
+    if (!s.ok) { console.error(`✗ ${name || t.label}：${s.error}`); continue; }
+    let res = s;
+    // 影片、排隊太久的自有機台圖片：點已扣、工單在跑，在這裡接著取件——不要重跑 tool，那會再扣一次。
+    if (s.async) {
+      process.stderr.write(`⏳ ${name || t.label}${isVideo ? '影片生成中，通常 1–5 分鐘' : '機台排隊中'}（${s.credits ? `已扣 ${s.credits} 點` : '未扣點'}）。中途離開可用這個 jobId 取回：\n   ${s.jobId}\n`);
+      const j = await waitJob({ url, key, jobId: s.jobId, everyMs: isVideo ? 10000 : 5000 });
+      if (!j) continue;
+      res = { ...j, credits: j.credits ?? s.credits };
+    }
+    // 好幾版時檔名帶上那一版的名字（多尺寸＝比例），不然同一秒存的會互相蓋掉。
+    const tag = safeName(name) || String(i + 1);
+    const out = r.steps.length > 1 && flags.out ? flags.out.replace(/(\.[a-z0-9]+)?$/i, (ext) => `-${tag}${ext}`) : flags.out;
+    const path = await saveResult(res, out, r.steps.length > 1 ? `${base}-${tag}` : base);
+    saved++;
+    console.log(`✓ ${name || t.label}（${spent(res.credits)}）→ ${path}`);
+  }
+  if (!saved) process.exitCode = 1;
+}
+
 // 影片是長任務：POST 只拿到 jobId，要輪詢 /api/v1/jobs/{id} 直到 done。
 // 伺服器完成後會把影片放上 Cloud Storage 並回公開網址，這裡抓那個網址存檔。
 async function generateVideo({ url, key, prompt, info, flags, refs = [] }) {
@@ -367,7 +501,7 @@ const FALLBACK_EXT = { image: 'png', video: 'mp4', audio: 'mp3' }; // 3D 猜不�
 
 /** 把生成結果寫到檔案，回寫入的路徑。有 dataUrl 就直接用（同一份位元組，省一次下載）；
  *  取件回來的常常只有網址（dataUrl 是空字串），那就下載它。 */
-async function saveResult(r, outFlag) {
+async function saveResult(r, outFlag, base) {
   let bytes, ext;
   const m = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+);base64,(.+)$/i.exec(r.dataUrl || '');
   if (m) {
@@ -381,7 +515,7 @@ async function saveResult(r, outFlag) {
   } else {
     fail('完成了但沒有拿到檔案（沒有網址也沒有內容）。');
   }
-  const out = pathResolve(outFlag || `banaverse-${stamp()}.${ext || FALLBACK_EXT[r.kind] || 'bin'}`);
+  const out = pathResolve(outFlag || `${base || `banaverse-${stamp()}`}.${ext || FALLBACK_EXT[r.kind] || 'bin'}`);
   writeFileSync(out, bytes);
   return out;
 }
@@ -406,6 +540,8 @@ const HELP = `banaverse — Banaverse 生成 CLI（文字生成圖片／影片�
   banaverse whoami                                  帳號與點數餘額
   banaverse models                                  可用模型與即時售價（圖片／影片／音訊／3D）
   banaverse generate "<提示>" [選項]                 生成圖片（加 --video 生成影片；加 --ref 用參考圖）
+  banaverse tools                                   工具清單（白背景、換背景、試穿、多尺寸、換畫風…）
+  banaverse tool <代號> --ref <圖> [--answer "…"]    用工具處理圖片（prompt 與模型是調好的，只要給圖）
   banaverse job <jobId> [--out <檔名>]              取回先前送出的影片、排隊中的圖片或 3D
   banaverse logout                                  清除本機設定
 
@@ -428,6 +564,12 @@ generate 選項：
 影片列的是一份的基準售價，實扣依秒數與解析度，送出後會印出實扣。各模型的可用值見
 https://banaverse.thepocket.company/api-docs 的「模型參考」。
 
+tool 選項：
+  --ref <檔案>     要處理的圖，照工具要的順序（例：試穿＝先人物、再衣服）。張數見 banaverse tools。
+  --answer "…"     工具要問的那一題（換背景＝換成什麼、多尺寸＝1:1、9:16）。選項題不給就用預設。
+  --model／--aspect／--size／--seconds／--out／--yes  同 generate。好幾版的工具（多尺寸、系列圖）
+                   每一版各扣一次點、各存一個檔（檔名帶上那一版的名字）。
+
 影片需 1–5 分鐘。中途 Ctrl+C 離開後，可用印出來的 jobId 跑 banaverse job <jobId> 取回；
 不要重跑 generate，那會再扣一次點。音訊與 3D 不在 CLI，請用 MCP（banaverse-mcp）或 API。
 
@@ -447,6 +589,8 @@ async function main() {
     case 'models': return cmdModels(flags);
     case 'generate': case 'gen': return cmdGenerate(pos, flags);
     case 'job': return cmdJob(pos, flags);
+    case 'tools': return cmdTools(flags);
+    case 'tool': return cmdTool(pos, flags);
     case undefined: case 'help': case '--help': case '-h': console.log(HELP); return;
     default: console.error(`未知指令：${cmd}\n`); console.log(HELP); process.exitCode = 1;
   }

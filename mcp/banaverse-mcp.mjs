@@ -5,6 +5,7 @@
 //
 // 工具（清單在下面的 TOOLS，這裡只列用途）：
 //   banaverse_generate_image／_video／_audio／_3d  生成（扣點；呼叫前應向使用者確認花費）
+//   banaverse_list_tools／banaverse_use_tool      工具（白背景、試穿、多尺寸…）：prompt 與模型是 Banaverse 調好的，只要給圖
 //   banaverse_get_job         影片、3D 與排隊太久的自有機台圖片取件
 //   banaverse_list_models     可用模型與售價（公開，免登入；登入了會標出未開通的）
 //   banaverse_get_balance     帳號與點數餘額
@@ -15,6 +16,8 @@
 // 認證：跑過 `banaverse login`（瀏覽器登入）後自動沿用 ~/.banaverse/config.json 的 OAuth token，
 //       快過期會自動換新（lib/auth.mjs，與 CLI 同一份）；或設環境變數 BANAVERSE_API_KEY（bnv_…）。
 //       BANAVERSE_URL 預設正式站。
+// 圖：refs 與 images 都收本機檔案路徑（lib/refs.mjs 在這一側讀成 data URL），也收 data URL、純 base64、Banaverse 回傳的網址。
+//     這是本機版勝過雲端版的地方：在 Claude Code 裡貼的圖會存成本機檔案，agent 給路徑就好，不必把整張圖轉成 base64 吐出來。
 // 相依：零（Node 18+ 內建 fetch）。協定：JSON-RPC 2.0 over stdio（換行分隔）。
 // 專案：https://github.com/The-Pocket-Company/Banaverse-CLI
 // ============================================================================
@@ -22,6 +25,7 @@ import { stdin, stdout, stderr, env } from 'node:process';
 import { readFileSync } from 'node:fs';
 import { loadCfg, hasLogin, bearer, DEFAULT_URL } from '../lib/auth.mjs';
 import { groupModels, priceLabel, lockedMark } from '../lib/catalog.mjs';
+import { isRemote, localImage } from '../lib/refs.mjs';
 
 // 認證來源優先序：環境變數 > CLI 設定檔（~/.banaverse/config.json，banaverse login 產生）> 預設。
 // → 只要跑過 `banaverse login`，MCP 免再設 env 就能沿用同一份登入（金鑰或 OAuth token 都行，
@@ -117,7 +121,7 @@ const TOOLS = [
         aspectRatio: { type: 'string', description: '1:1 / 16:9 / 9:16 …（預設依模型：Nano Banana 系文生圖 16:9、改圖沿用參考圖比例；Seedream 與 Banaverse Image 1:1）' },
         imageSize: { type: 'string', description: '512px / 1K / 2K / 4K（可用值與預設依模型：Nano Banana 2 Lite 只有 1K、Pro 預設 2K；不支援的值會被夾回預設，自有機台模型則回錯誤並列出可用值、不扣點）。解析度影響售價' },
         searchGrounding: { type: 'boolean', description: '生成前先用 Google 搜尋取得真實資訊（僅 Nano Banana Pro 與 2 支援）。會加價：每張另加一筆搜尋費（目前約 0.38 份基準售價），banaverse_list_models 的價目不含這項' },
-        refs: { type: 'array', items: { type: 'string' }, description: '參考圖（data URL／純 base64／本工具回傳的網址），給了＝圖生圖。不接受其他網站的圖片網址（會回 400）；張數上限依模型，超過的會被截掉' },
+        refs: { type: 'array', items: { type: 'string' }, description: '參考圖（本機檔案路徑（png／jpg／webp／gif）、data URL、純 base64，或本工具回傳的網址），給了＝圖生圖。不接受其他網站的圖片網址（會回 400）；張數上限依模型，超過的會被截掉' },
       },
       required: ['prompt'],
     },
@@ -137,7 +141,7 @@ const TOOLS = [
         resolution: { type: 'string', description: '480p / 720p / 1080p / 4k（依模型；直接影響售價）' },
         generateAudio: { type: 'boolean', description: '是否生成原生配音（部分模型恆開，關不掉）' },
         negativePrompt: { type: 'string', description: '不想出現的內容（僅 Veo）' },
-        refs: { type: 'array', items: { type: 'string' }, description: '參考圖，給了＝圖生影。一律當風格／主體參考，不是首幀（veo-3.1-lite-generate-preview 例外：只取第一張當首幀）；Veo 3.1／Fast 掛參考圖時固定 8 秒、照 8 秒扣點。要讓圖動起來請在 prompt 裡描述' },
+        refs: { type: 'array', items: { type: 'string' }, description: '參考圖（本機檔案路徑（png／jpg／webp／gif）、data URL、純 base64，或本工具回傳的網址），給了＝圖生影。一律當風格／主體參考，不是首幀（veo-3.1-lite-generate-preview 例外：只取第一張當首幀）；Veo 3.1／Fast 掛參考圖時固定 8 秒、照 8 秒扣點。要讓圖動起來請在 prompt 裡描述' },
         videoRefs: { type: 'array', items: { type: 'string' }, description: '參考影片（目前僅 seedance-2.5）。形式：data:video/…;base64,… 或 Banaverse 回傳的網址；不接受純 base64 與其他網站的網址' },
       },
       required: ['prompt'],
@@ -169,7 +173,7 @@ const TOOLS = [
         model: { type: 'string', description: '模型 id（必填，例：hyper3d-gen2、hitem3d-2.0）' },
         refs: {
           type: 'array', items: { type: 'string' }, maxItems: 5,
-          description: '參考圖，給了＝圖生 3D。hyper3d-gen2 最多 5 張、hitem3d-2.0 最多 4 張。'
+          description: '參考圖（本機檔案路徑（png／jpg／webp／gif）、data URL、純 base64，或本工具回傳的網址），給了＝圖生 3D。hyper3d-gen2 最多 5 張、hitem3d-2.0 最多 4 張。'
             + '**hitem3d-2.0 的順序固定為正面、背面、左側、右側**。每張長寬比要在 0.40～2.50 之間。',
         },
         material: { type: 'string', enum: ['PBR', 'Shaded', 'None'], description: 'hyper3d-gen2 專用。None＝純白模。不影響售價。' },
@@ -179,6 +183,34 @@ const TOOLS = [
         tPose: { type: 'boolean', description: 'hyper3d-gen2 專用。強制 T/A 字站姿。預設關。' },
       },
       required: ['prompt', 'model'],
+    },
+  },
+  {
+    name: 'banaverse_list_tools',
+    description: 'Banaverse 的工具清單：白背景、換背景、試穿、AI 模特兒、形象照、多尺寸、換畫風、讓圖動起來…共 8 類。'
+      + '工具的 prompt、模型與比例是 Banaverse 調好的，你只要給圖（與一句答案）。使用者要做的事屬於這些時，'
+      + '先呼叫本工具看要幾張圖、answer 怎麼填，再用 banaverse_use_tool——比自己寫 prompt 叫 banaverse_generate_image 穩定。',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'banaverse_use_tool',
+    description: '用一個 Banaverse 工具處理圖片（清單、每個工具要幾張圖、answer 怎麼填，見 banaverse_list_tools）。'
+      + '會扣使用者點數，一次好幾版的工具（多尺寸、系列圖、角色寫真）每一版各扣一次——呼叫前請先向使用者確認花費（banaverse_list_models 查價）。'
+      + '圖片工具直接回圖（自有機台排隊太久時回 jobId）；影片工具回 jobId。兩者都用 banaverse_get_job 取件，不要重送。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tool: { type: 'string', description: '工具代號（banaverse_list_tools 列的那個，例：whitebg、tryon、resize）' },
+        answer: { type: 'string', description: '工具要問的那一題的答案（例：換背景填「大理石桌面」、換畫風填「水彩繪本」、多尺寸填「1:1、9:16」）。沒有題目的工具不用給；選項題不給就用預設。' },
+        images: {
+          type: 'array', items: { type: 'string' },
+          description: '要處理的圖，照工具要的順序（例：試穿＝先人物、再衣服）。每筆可以是本機檔案路徑（png／jpg／webp／gif）、data URL、純 base64，或本工具回傳的網址；不接受其他網站的圖片網址。使用者貼在對話裡的圖若有本機路徑，直接給路徑。',
+        },
+        model: { type: 'string', description: '選填。不給就用工具預設的模型；要換就填同一類（圖片／影片）的模型 id。' },
+        aspectRatio: { type: 'string', description: '選填。只對只出一版的工具有效（多尺寸的比例就是答案本身）。' },
+        imageSize: { type: 'string', description: '選填，圖片解析度（512px／1K／2K／4K，依模型）。影響售價。' },
+      },
+      required: ['tool', 'images'],
     },
   },
   {
@@ -200,6 +232,12 @@ const TOOLS = [
 ];
 
 const spent = (c) => (c ? `花 ${c} 點` : '未扣點');
+
+/** refs／images：本機檔案讀成 data URL，其餘（data URL、網址、純 base64）原樣送給伺服器判斷。 */
+function resolveImages(list) {
+  if (!Array.isArray(list)) return list;
+  return list.map((r) => (typeof r !== 'string' || isRemote(r) ? r : (localImage(r) ?? r)));
+}
 const IMG_RE = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i;
 
 /** 圖片結果 → MCP 內容：圖本體（Claude 看得到圖）＋一行說明。網址一定要附：
@@ -235,7 +273,7 @@ async function callTool(name, args) {
         method: 'POST',
         body: {
           prompt: args.prompt, model: args.model, aspectRatio: args.aspectRatio, imageSize: args.imageSize,
-          searchGrounding: args.searchGrounding, refs: args.refs,
+          searchGrounding: args.searchGrounding, refs: resolveImages(args.refs),
         },
       });
       // 自有機台的圖片排隊太久：伺服器回 async＋jobId（點已扣、工單在跑）。叫 agent 去取件、不要重送。
@@ -258,7 +296,7 @@ async function callTool(name, args) {
         // 3D 的型錄一個都沒有，只會被伺服器丟掉並殘留在生成紀錄裡，讓紀錄上出現這顆模型根本沒有的旋鈕。
         body: is3d
           ? {
-              kind: '3d', prompt: args.prompt, model: args.model, refs: args.refs,
+              kind: '3d', prompt: args.prompt, model: args.model, refs: resolveImages(args.refs),
               material: args.material, meshMode: args.meshMode, detail: args.detail,
               textures4K: args.textures4K, tPose: args.tPose,
             }
@@ -267,12 +305,36 @@ async function callTool(name, args) {
               prompt: args.prompt, model: args.model, aspectRatio: args.aspectRatio,
               durationSec: args.durationSec, resolution: args.resolution,
               generateAudio: args.generateAudio, negativePrompt: args.negativePrompt,
-              refs: args.refs, videoRefs: args.videoRefs,
+              refs: resolveImages(args.refs), videoRefs: args.videoRefs,
             },
       });
       return textResult(`已送出「${d.label}」${is3d ? '3D' : '影片'}生成，jobId：${d.jobId}\n`
         + `${d.credits ? `已扣 ${d.credits} 點（工單失敗時，下一次取件會退點——所以要一直取到有結果或錯誤）。` : '未扣點。'}\n`
         + '請每隔約 15 秒用 banaverse_get_job 帶這個 jobId 取件；不要重送，重送會再扣一次點。');
+    }
+    case 'banaverse_list_tools': {
+      // 說明文字由伺服器出（跟雲端 MCP 的 banaverse_list_tools 同一份，型錄改了這裡不必跟著改）。
+      const d = await api('/api/v1/tools');
+      return textResult(`Banaverse 工具（用 banaverse_use_tool 呼叫；images 照順序給，可以是本機檔案路徑）：\n\n${d.reference}`);
+    }
+    case 'banaverse_use_tool': {
+      if (!args.tool) return errResult('缺少 tool（工具代號，見 banaverse_list_tools）');
+      const d = await api('/api/v1/tools', {
+        method: 'POST',
+        body: {
+          tool: args.tool, answer: args.answer, images: resolveImages(args.images), model: args.model,
+          aspectRatio: args.aspectRatio, imageSize: args.imageSize,
+        },
+      });
+      // 一版就照 generate_image 的樣子回（圖本體＋網址）；好幾版只給網址——四張內嵌圖動輒十幾 MB，client 會整段截掉。
+      const ok = d.steps.filter((s) => s.ok);
+      if (d.steps.length === 1 && ok.length === 1 && !ok[0].async) return imageContent(ok[0], `用「${d.toolLabel}」完成`);
+      const lines = d.steps.map((s) => {
+        if (!s.ok) return `「${s.step}」失敗：${s.error}`;
+        if (s.async) return `「${s.step}」已送出，jobId：${s.jobId}（${s.credits ? `已扣 ${s.credits} 點` : '未扣點'}）——每隔約 ${d.out === 'video' ? 15 : 10} 秒用 banaverse_get_job 取件，不要重送。`;
+        return `「${s.step}」：${s.url ?? '（上傳失敗，請改用單版重做）'}（${spent(s.credits)}）`;
+      });
+      return { content: [{ type: 'text', text: `用「${d.toolLabel}」（${d.model}）：\n${lines.join('\n')}` }], ...(ok.length ? {} : { isError: true }) };
     }
     case 'banaverse_get_job': {
       if (!args.jobId) return errResult('缺少 jobId');

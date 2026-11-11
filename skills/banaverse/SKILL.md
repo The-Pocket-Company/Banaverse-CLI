@@ -1,6 +1,6 @@
 ---
 name: banaverse
-description: Generate images and video with Banaverse (Nano Banana images, Veo video), from a text prompt or from reference images — via the Banaverse MCP tools if they are available in this session, otherwise via the banaverse CLI. Use when the user wants to create / draw / make an image, make a video or animate a picture, and mentions Banaverse, or wants to spend Banaverse credits to generate. Generating spends credits, so always confirm the cost with the user before generating.
+description: Generate and edit images and video with Banaverse (Nano Banana images, Veo video) — from a text prompt, from reference images, or with a ready-made Banaverse tool (white background, try-on, multi-size, restyle, animate…) — via the Banaverse MCP tools if they are available in this session, otherwise via the banaverse CLI. Use when the user wants to create / draw / make or edit an image, make a video or animate a picture, and mentions Banaverse, or wants to spend Banaverse credits to generate. Generating spends credits, so always confirm the cost with the user before generating.
 ---
 
 # Banaverse image and video generation
@@ -33,6 +33,29 @@ which one you used, either way. Rough rule:
 
 Banaverse spends real credits, so never reach for it just because it is there — but equally, never
 quietly swap in a different generator when the user asked for Banaverse.
+
+## Use a tool when one fits
+
+Banaverse has ready-made **tools** for common jobs — white background, change background, try-on
+(person + garment), AI model shots, headshots, multi-size, restyle, remove objects, animate a photo,
+and more (48, in 8 categories). A tool's prompt, model and aspect ratio are tuned by Banaverse; you
+only pass the tool id, the image(s) in the right order, and at most one short answer
+(e.g. which background). **When the user's request matches a tool, use the tool instead of writing
+your own prompt** — the result is more reliable and you don't spend tokens on a prompt.
+
+- MCP: `banaverse_list_tools` (what each tool needs) → `banaverse_use_tool`. The bundled local server
+  (`banaverse-mcp`) takes **local file paths** in `images` — when the user pasted an image and you have
+  its path, pass the path; never convert an image to base64 yourself.
+- CLI: `banaverse tools` → `banaverse tool <id> --ref <file> [--ref <file>] [--answer "…"]`, e.g.
+
+  ```bash
+  banaverse tool tryon --ref person.jpg --ref shirt.jpg --out tryon.png --yes
+  banaverse tool background --ref product.jpg --answer "marble countertop" --yes
+  banaverse tool resize --ref poster.png --answer "1:1、9:16" --yes   # one file per size
+  ```
+
+Tools that make several versions (multi-size, series, character shoot) charge once **per version**;
+the cost confirmation shows the total. Same rules as below: confirm the cost, then `--yes`.
 
 ## The command
 
@@ -152,8 +175,10 @@ of the whole picture.
 The same account also exposes an MCP server at `https://banaverse.thepocket.company/api/mcp`
 (tools include `banaverse_generate_image` + `banaverse_get_image`, `banaverse_generate_video` +
 `banaverse_get_video`, `banaverse_generate_audio`, `banaverse_generate_3d` + `banaverse_get_3d`,
-`banaverse_list_models`, `banaverse_get_balance`). This package also ships a local stdio server,
-`banaverse-mcp`, with the same generate tools and a single `banaverse_get_job` for retrieval.
+`banaverse_list_tools` + `banaverse_use_tool`, `banaverse_list_models`, `banaverse_get_balance`).
+This package also ships a local stdio server, `banaverse-mcp`, with the same generate and tool tools
+and a single `banaverse_get_job` for retrieval. The local server reads **local file paths** in `refs`
+and `images`; the hosted one only takes data URLs or URLs Banaverse returned.
 If those tools are already available in this session, prefer them — no install needed. The CLI is the
 better choice when the user wants the file written to disk, since MCP returns a URL rather than a local file.
 

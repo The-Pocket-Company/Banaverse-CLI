@@ -4,6 +4,7 @@
 
 - 🖼️ **Text‑to‑image** from the command line — `banaverse generate "…"`
 - 🎬 **Text‑to‑video** — `banaverse generate "…" --video` (Veo; long job, polls and saves the .mp4 for you)
+- 🧰 **Tools** — `banaverse tool tryon --ref person.jpg --ref shirt.jpg`: white background, try‑on, multi‑size, restyle… with prompts tuned by Banaverse
 - 🔌 **MCP server** — connect Banaverse to Claude Desktop / Claude Code / any MCP client (images, video, audio and 3D)
 - 🤖 **Agent‑ready** — a bundled skill teaches coding agents to drive the CLI safely
 - 🔑 **One sign‑in** — browser OAuth; no API keys to copy or paste
@@ -37,6 +38,8 @@ banaverse generate "a duck bobbing on calm water" --video   # 影片（長任務
 | `banaverse whoami` | Show the signed‑in account and credit balance. |
 | `banaverse models` | List available models (image, video, audio, 3D) with live prices from the server. |
 | `banaverse generate "<prompt>"` | Generate an image — add `--video` for video, `--ref` to start from an image. Confirms the cost first (skip with `--yes`). |
+| `banaverse tools` | List the tools (white background, change background, try‑on, multi‑size, restyle, animate…) and what each needs. |
+| `banaverse tool <id> --ref <file>` | Run a tool on your image(s). Prompt, model and aspect ratio are tuned by Banaverse; add `--answer "…"` when the tool asks one thing (e.g. which background). Multi‑version tools save one file per version. Confirms the cost first. |
 | `banaverse job <jobId>` | Retrieve a job submitted earlier: a video you interrupted, a queued image, or a 3D model submitted via MCP / API. |
 | `banaverse logout` | Remove the local config. |
 
@@ -73,7 +76,7 @@ After `npm install -g @banaverse/cli`, register the bundled MCP server. Example 
 }
 ```
 
-It exposes `banaverse_generate_image`, `banaverse_generate_video`, `banaverse_generate_audio`, `banaverse_generate_3d`, `banaverse_get_job` (retrieves video, 3D, and queued images), `banaverse_list_models`, `banaverse_get_balance` — and reuses the `banaverse login` sign‑in (or `BANAVERSE_API_KEY`).
+It exposes `banaverse_generate_image`, `banaverse_generate_video`, `banaverse_generate_audio`, `banaverse_generate_3d`, `banaverse_list_tools` + `banaverse_use_tool`, `banaverse_get_job` (retrieves video, 3D, and queued images), `banaverse_list_models`, `banaverse_get_balance` — and reuses the `banaverse login` sign‑in (or `BANAVERSE_API_KEY`). Image inputs (`refs`, `images`) can be **local file paths**, so an agent can pass the path of an image you pasted instead of base64.
 
 > Prefer a hosted, no‑install option? The Banaverse web app also offers a **remote MCP connector** (paste a URL, sign in with Google) — see the **MCP & CLI** panel in your account menu on [banaverse.thepocket.company](https://banaverse.thepocket.company).
 
