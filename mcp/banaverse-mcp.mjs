@@ -18,6 +18,7 @@
 //       BANAVERSE_URL 預設正式站。
 // 圖：refs 與 images 都收本機檔案路徑（lib/refs.mjs 在這一側讀成 data URL），也收 data URL、純 base64、Banaverse 回傳的網址。
 //     這是本機版勝過雲端版的地方：在 Claude Code 裡貼的圖會存成本機檔案，agent 給路徑就好，不必把整張圖轉成 base64 吐出來。
+// 影片：banaverse_use_tool 的 videos 同樣收本機路徑，但一次請求最多 32 MiB（理由與上限見 lib/refs.mjs），大檔請給 Banaverse 網址。
 // 相依：零（Node 18+ 內建 fetch）。協定：JSON-RPC 2.0 over stdio（換行分隔）。
 // 專案：https://github.com/The-Pocket-Company/Banaverse-CLI
 // ============================================================================
@@ -25,7 +26,7 @@ import { stdin, stdout, stderr, env } from 'node:process';
 import { readFileSync } from 'node:fs';
 import { loadCfg, hasLogin, bearer, DEFAULT_URL } from '../lib/auth.mjs';
 import { groupModels, priceLabel, lockedMark } from '../lib/catalog.mjs';
-import { isRemote, localImage } from '../lib/refs.mjs';
+import { isRemote, localImage, localVideo, localAudio, mp4Seconds, bodyTooBig } from '../lib/refs.mjs';
 
 // 認證來源優先序：環境變數 > CLI 設定檔（~/.banaverse/config.json，banaverse login 產生）> 預設。
 // → 只要跑過 `banaverse login`，MCP 免再設 env 就能沿用同一份登入（金鑰或 OAuth token 都行，
@@ -91,9 +92,13 @@ async function handle(line) {
 async function api(path, { method = 'GET', body, _retried = false } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   // 每次呼叫現取：MCP server 會活很久，一小時前拿的 token 這一刻可能已經過期
+  const json = body ? JSON.stringify(body) : undefined;
+  // 太大的先擋：Cloud Run 會直接回 413、連錯誤原因都沒有（上限與理由見 lib/refs.mjs）。
+  const big = json && bodyTooBig(json);
+  if (big) throw new Error(big);
   const key = await bearer(URL_BASE, { env, force: _retried });
   if (key) headers.Authorization = `Bearer ${key}`;
-  const res = await fetch(URL_BASE + path, { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) });
+  const res = await fetch(URL_BASE + path, { method, headers, ...(json ? { body: json } : {}) });
   // 401 且還沒重試過：強制換一次 token 再來一回（時鐘差、或上次換新沒存到）
   if (res.status === 401 && key && !_retried) return api(path, { method, body, _retried: true });
   const d = await res.json().catch(() => ({}));
@@ -187,16 +192,17 @@ const TOOLS = [
   },
   {
     name: 'banaverse_list_tools',
-    description: 'Banaverse 的工具清單：白背景、換背景、試穿、AI 模特兒、形象照、多尺寸、換畫風、讓圖動起來…共 8 類。'
-      + '工具的 prompt、模型與比例是 Banaverse 調好的，你只要給圖（與一句答案）。使用者要做的事屬於這些時，'
-      + '先呼叫本工具看要幾張圖、answer 怎麼填，再用 banaverse_use_tool——比自己寫 prompt 叫 banaverse_generate_image 穩定。',
+    description: 'Banaverse 的工具清單：白背景、換背景、試穿、去背、多尺寸、換畫風、讓圖動起來、影片去背、把幾段影片接成一支、影片轉比例、把配音或配樂放進影片、上字幕…共 8 類。'
+      + '工具的 prompt、模型與比例是 Banaverse 調好的，你只要給圖或影片（與一句答案）。使用者要做的事屬於這些時，'
+      + '先呼叫本工具看要幾張圖或幾段影片、answer 怎麼填，再用 banaverse_use_tool——比自己寫 prompt 叫 banaverse_generate_image 穩定。',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'banaverse_use_tool',
-    description: '用一個 Banaverse 工具處理圖片（清單、每個工具要幾張圖、answer 怎麼填，見 banaverse_list_tools）。'
+    description: '用一個 Banaverse 工具處理圖片或影片（清單、每個工具要幾張圖或幾段影片、answer 怎麼填，見 banaverse_list_tools）。'
       + '會扣使用者點數，一次好幾版的工具（多尺寸、系列圖、角色寫真）每一版各扣一次——呼叫前請先向使用者確認花費（banaverse_list_models 查價）。'
-      + '圖片工具直接回圖（自有機台排隊太久時回 jobId）；影片工具回 jobId。兩者都用 banaverse_get_job 取件，不要重送。',
+      + '在 Banaverse 機台上處理的工具（去背、影片去背、接成一支、轉比例、配上聲音、上字幕）不在 banaverse_list_models 裡：使用者的公司有自己的機台就不扣點，否則照價扣點，實扣看回應。'
+      + '圖片工具直接回圖（機台排隊時回 jobId）；影片工具回 jobId。兩者都用 banaverse_get_job 取件，不要重送。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -204,13 +210,27 @@ const TOOLS = [
         answer: { type: 'string', description: '工具要問的那一題的答案（例：換背景填「大理石桌面」、換畫風填「水彩繪本」、多尺寸填「1:1、9:16」）。沒有題目的工具不用給；選項題不給就用預設。' },
         images: {
           type: 'array', items: { type: 'string' },
-          description: '要處理的圖，照工具要的順序（例：試穿＝先人物、再衣服）。每筆可以是本機檔案路徑（png／jpg／webp／gif）、data URL、純 base64，或本工具回傳的網址；不接受其他網站的圖片網址。使用者貼在對話裡的圖若有本機路徑，直接給路徑。',
+          description: '吃圖的工具要處理的圖，照工具要的順序（例：試穿＝先人物、再衣服）。每筆可以是本機檔案路徑（png／jpg／webp／gif）、data URL、純 base64，或本工具回傳的網址；不接受其他網站的圖片網址。使用者貼在對話裡的圖若有本機路徑，直接給路徑。吃影片的工具不用給。',
         },
-        model: { type: 'string', description: '選填。不給就用工具預設的模型；要換就填同一類（圖片／影片）的模型 id。' },
-        aspectRatio: { type: 'string', description: '選填。只對只出一版的工具有效（多尺寸的比例就是答案本身）。' },
+        videos: {
+          type: 'array', items: { type: 'string' },
+          description: '吃影片的工具（影片去背、接成一支、轉比例、配上聲音、上字幕）要處理的影片，照順序（接成一支就照這個順序接，2～10 段）。'
+            + '每筆可以是 Banaverse 回傳過的影片網址、data:video/…;base64,…，或本機影片檔路徑（mp4／mov／webm／m4v）。'
+            + '本機檔案一次合計約 23 MB 以內（雲端單次請求上限 32 MB），超過會直接回錯誤、不扣點；大檔請改給 Banaverse 網址。不接受其他網站的網址與純 base64。',
+        },
+        audios: {
+          type: 'array', items: { type: 'string' },
+          description: '配上聲音（dub）要放進影片的那段聲音（配音、配樂），1 段。可以是本機聲音檔路徑（mp3／wav／m4a／aac／ogg／flac）、'
+            + 'Banaverse 回傳過的音訊網址（例：banaverse_generate_audio 的成品），或 data:audio/…;base64,…。本機檔案與影片合計約 23 MB 以內。',
+        },
+        audioMix: { type: 'string', enum: ['replace', 'music', 'voice'], description: '配上聲音專用：replace＝換掉原音（預設）、music＝當背景音樂（原音為主）、voice＝當旁白（原音調小）。' },
+        durationSec: { type: 'number', description: '影片去背專用：影片有幾秒（按秒計價）。本機 mp4／mov 不用給，這裡會自己讀；給 Banaverse 網址時請填，沒填照 5 秒算，影片比填的長會被退回（不扣點）並告訴你實際秒數。' },
+        model: { type: 'string', description: '選填。不給就用工具預設的模型；要換就填同一類（圖片／影片）的模型 id。機台上的處理工具不用給，伺服器會挑（有自己的機台就用自己的）。' },
+        aspectRatio: { type: 'string', description: '選填。只對只出一版的工具有效（多尺寸的比例就是答案本身）。轉比例：9:16、16:9、1:1（預設 9:16）。' },
+        fit: { type: 'string', enum: ['blur', 'crop'], description: '轉比例專用：blur＝完整保留，空出來的地方用同一段影片模糊補滿（預設）；crop＝從中間裁切填滿，邊緣會被裁掉。' },
         imageSize: { type: 'string', description: '選填，圖片解析度（512px／1K／2K／4K，依模型）。影響售價。' },
       },
-      required: ['tool', 'images'],
+      required: ['tool'],
     },
   },
   {
@@ -237,6 +257,28 @@ const spent = (c) => (c ? `花 ${c} 點` : '未扣點');
 function resolveImages(list) {
   if (!Array.isArray(list)) return list;
   return list.map((r) => (typeof r !== 'string' || isRemote(r) ? r : (localImage(r) ?? r)));
+}
+/** videos：本機檔案讀成 data URL；網址與 data URL 原樣送。不是兩者、也找不到檔案的就在這裡擋——
+ *  伺服器會把不像網址的字串當成純 base64 的「圖」，回來的錯誤變成「第 1 段影片不是影片（image/png）」，看不出是路徑打錯。 */
+function resolveVideos(list) {
+  if (!Array.isArray(list)) return list;
+  return list.map((r) => {
+    if (typeof r !== 'string' || isRemote(r)) return r;
+    const data = localVideo(r);
+    if (!data) throw new Error(`找不到影片檔：${r}（videos 收本機影片路徑、Banaverse 回傳過的影片網址，或 data:video/… 的 data URL）`);
+    return data;
+  });
+}
+const ceilSec = (x) => (x ? Math.ceil(x - 1e-6) : undefined);
+/** audios：同 videos，本機聲音檔讀成 data URL。 */
+function resolveAudios(list) {
+  if (!Array.isArray(list)) return list;
+  return list.map((r) => {
+    if (typeof r !== 'string' || isRemote(r)) return r;
+    const data = localAudio(r);
+    if (!data) throw new Error(`找不到聲音檔：${r}（audios 收本機聲音檔路徑、Banaverse 回傳過的音訊網址，或 data:audio/… 的 data URL）`);
+    return data;
+  });
 }
 const IMG_RE = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i;
 
@@ -315,15 +357,19 @@ async function callTool(name, args) {
     case 'banaverse_list_tools': {
       // 說明文字由伺服器出（跟雲端 MCP 的 banaverse_list_tools 同一份，型錄改了這裡不必跟著改）。
       const d = await api('/api/v1/tools');
-      return textResult(`Banaverse 工具（用 banaverse_use_tool 呼叫；images 照順序給，可以是本機檔案路徑）：\n\n${d.reference}`);
+      return textResult('Banaverse 工具（用 banaverse_use_tool 呼叫；images／videos／audios 照順序給，可以是本機檔案路徑，'
+        + `本機檔案一次合計約 23 MB 以內）：\n\n${d.reference}`);
     }
     case 'banaverse_use_tool': {
       if (!args.tool) return errResult('缺少 tool（工具代號，見 banaverse_list_tools）');
+      const videos = resolveVideos(args.videos);
       const d = await api('/api/v1/tools', {
         method: 'POST',
         body: {
-          tool: args.tool, answer: args.answer, images: resolveImages(args.images), model: args.model,
-          aspectRatio: args.aspectRatio, imageSize: args.imageSize,
+          tool: args.tool, answer: args.answer, images: resolveImages(args.images), videos, audios: resolveAudios(args.audios),
+          model: args.model, aspectRatio: args.aspectRatio, fit: args.fit, imageSize: args.imageSize, audioMix: args.audioMix,
+          // 影片去背按秒計價：呼叫端沒給秒數、影片又是本機 mp4／mov，就照檔案讀出來的長度填。
+          durationSec: args.durationSec ?? (args.tool === 'videocutout' && videos?.[0] ? ceilSec(mp4Seconds(videos[0])) : undefined),
         },
       });
       // 一版就照 generate_image 的樣子回（圖本體＋網址）；好幾版只給網址——四張內嵌圖動輒十幾 MB，client 會整段截掉。

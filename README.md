@@ -5,6 +5,7 @@
 - 🖼️ **Text‑to‑image** from the command line — `banaverse generate "…"`
 - 🎬 **Text‑to‑video** — `banaverse generate "…" --video` (Veo; long job, polls and saves the .mp4 for you)
 - 🧰 **Tools** — `banaverse tool tryon --ref person.jpg --ref shirt.jpg`: white background, try‑on, multi‑size, restyle… with prompts tuned by Banaverse
+- ✂️ **Video tools** — `banaverse tool join --video a.mp4 --video b.mp4`: background removal, video background removal, join clips, reframe to 9:16 / 16:9 / 1:1
 - 🔌 **MCP server** — connect Banaverse to Claude Desktop / Claude Code / any MCP client (images, video, audio and 3D)
 - 🤖 **Agent‑ready** — a bundled skill teaches coding agents to drive the CLI safely
 - 🔑 **One sign‑in** — browser OAuth; no API keys to copy or paste
@@ -38,8 +39,9 @@ banaverse generate "a duck bobbing on calm water" --video   # 影片（長任務
 | `banaverse whoami` | Show the signed‑in account and credit balance. |
 | `banaverse models` | List available models (image, video, audio, 3D) with live prices from the server. |
 | `banaverse generate "<prompt>"` | Generate an image — add `--video` for video, `--ref` to start from an image. Confirms the cost first (skip with `--yes`). |
-| `banaverse tools` | List the tools (white background, change background, try‑on, multi‑size, restyle, animate…) and what each needs. |
+| `banaverse tools` | List the tools (white background, try‑on, background removal, multi‑size, restyle, animate, join clips, reframe…) and what each needs. |
 | `banaverse tool <id> --ref <file>` | Run a tool on your image(s). Prompt, model and aspect ratio are tuned by Banaverse; add `--answer "…"` when the tool asks one thing (e.g. which background). Multi‑version tools save one file per version. Confirms the cost first. |
+| `banaverse tool <id> --video <file>` | Run a video tool (`videocutout`, `join`, `reframe`) on your clip(s), in order. See [`tool` options](#tool-options). |
 | `banaverse job <jobId>` | Retrieve a job submitted earlier: a video you interrupted, a queued image, or a 3D model submitted via MCP / API. |
 | `banaverse logout` | Remove the local config. |
 
@@ -60,6 +62,23 @@ Prices are never hard‑coded here — `banaverse models` shows the server's liv
 
 Some image models run on Banaverse's own GPUs and can queue. If the queue is long the CLI keeps polling for you; if you stop it, retrieve the image later with `banaverse job <jobId>` — don't re‑run `generate`, that charges again. Audio and 3D are available through MCP and the API, not `generate`.
 
+### `tool` options
+
+| Flag | Meaning |
+|---|---|
+| `--ref <file>` | The image(s) to process, in the order the tool expects (try‑on: person, then garment). Same formats as `generate --ref`. |
+| `--video <file>` | The video(s) to process, in order — `join` takes 2–10 clips and joins them in that order. A local mp4/mov/webm/m4v, or a video URL Banaverse returned. |
+| `--audio <file>` | `dub` only: the voice‑over or music to put into the video (mp3/wav/m4a/aac/ogg/flac, or an audio URL Banaverse returned). |
+| `--mix <replace\|music\|voice>` | `dub` only: replace the original sound (default), lay it under as background music, or use it as narration over a lowered original. |
+| `--answer "…"` | The one question the tool asks (which background, which sizes…). Choice questions fall back to their defaults. `--answer @file.txt` reads it from a file — `subtitle` takes the whole subtitle text, one line per caption starting with its time (`0:00-0:03 Hello`). |
+| `--aspect <ratio>` | Single‑version tools only. For `reframe`: `9:16` (default), `16:9` or `1:1`. |
+| `--fit <blur\|crop>` | `reframe` only: `blur` keeps the whole frame and fills the bars with a blurred copy (default); `crop` crops from the centre to fill. |
+| `--model` / `--size` / `--seconds` / `--out` / `--yes` | As for `generate`. `videocutout` is priced per second of video: for a local mp4/mov the CLI reads the length itself; for a Banaverse URL pass `--seconds`. |
+
+**Local video size limit.** The CLI has to send local files inside the request, and one request to Banaverse can be at most 32 MB; base64 adds about a third, so local files in one call must total **about 23 MB or less**. Larger files are refused before anything is sent (nothing is charged) — compress or trim them, or pass a video URL Banaverse returned, which has no such limit.
+
+Background removal, video background removal, join, reframe, dub and subtitle run on Banaverse's RTX machines: if your company has its own machine they run there for free, otherwise on Banaverse's machine at the listed price. These tools are not in `banaverse models`; the actual charge is printed after submitting.
+
 ## Use it from your AI tools
 
 ### MCP (Claude Desktop, Claude Code, any MCP client)
@@ -76,7 +95,7 @@ After `npm install -g @banaverse/cli`, register the bundled MCP server. Example 
 }
 ```
 
-It exposes `banaverse_generate_image`, `banaverse_generate_video`, `banaverse_generate_audio`, `banaverse_generate_3d`, `banaverse_list_tools` + `banaverse_use_tool`, `banaverse_get_job` (retrieves video, 3D, and queued images), `banaverse_list_models`, `banaverse_get_balance` — and reuses the `banaverse login` sign‑in (or `BANAVERSE_API_KEY`). Image inputs (`refs`, `images`) can be **local file paths**, so an agent can pass the path of an image you pasted instead of base64.
+It exposes `banaverse_generate_image`, `banaverse_generate_video`, `banaverse_generate_audio`, `banaverse_generate_3d`, `banaverse_list_tools` + `banaverse_use_tool`, `banaverse_get_job` (retrieves video, 3D, and queued images), `banaverse_list_models`, `banaverse_get_balance` — and reuses the `banaverse login` sign‑in (or `BANAVERSE_API_KEY`). Image inputs (`refs`, `images`) can be **local file paths**, so an agent can pass the path of an image you pasted instead of base64. `banaverse_use_tool` also takes `videos` (local paths or Banaverse video URLs, same ~23 MB limit for local files), `fit` for `reframe`, `audios` + `audioMix` for `dub`, and `durationSec` for `videocutout` (read automatically from local mp4/mov files).
 
 > Prefer a hosted, no‑install option? The Banaverse web app also offers a **remote MCP connector** (paste a URL, sign in with Google) — see the **MCP & CLI** panel in your account menu on [banaverse.thepocket.company](https://banaverse.thepocket.company).
 

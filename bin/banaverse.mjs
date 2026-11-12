@@ -6,7 +6,7 @@
 //   banaverse models            列出可用模型與即時售價（圖片／影片／音訊／3D）
 //   banaverse generate "<提示>"   生成圖片；--video 生成影片（預設先顯示花費並確認；--yes 跳過）
 //   banaverse tools             列出工具（白背景、試穿、多尺寸…）
-//   banaverse tool <代號>        用工具處理圖片：prompt、模型、比例是 Banaverse 調好的，你只給圖（與一句答案）
+//   banaverse tool <代號>        用工具處理圖片或影片：prompt、模型、比例是 Banaverse 調好的，你只給圖或影片（與一句答案）
 //   banaverse job <jobId>       取回先前送出的影片、排隊中的圖片或 3D
 //   banaverse logout            清除本機設定
 //
@@ -27,7 +27,7 @@ import { resolve as pathResolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { CFG_FILE, DEFAULT_URL, loadCfg, saveCfg, clearCfg, bearer } from '../lib/auth.mjs';
 import { groupModels, priceLabel, imageQuote, lockedMark, KIND_ZH } from '../lib/catalog.mjs';
-import { isRemote, localImage } from '../lib/refs.mjs';
+import { isRemote, localImage, localVideo, bodyTooBig, localAudio, mp4Seconds, answerText } from '../lib/refs.mjs';
 import { createServer } from 'node:http';
 import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -48,17 +48,20 @@ async function resolved(flags) {
 // 教訓（2026-07-29 實測）：舊版把未知旗標默默當布林，`--ref a.png` 在還沒有 --ref 的版本上
 // 被吞掉、a.png 變成提示詞的一部分，八次生成 40 點全變成無參考的錯圖，全程零錯誤訊息。
 // 拼錯參數的代價不能是「扣了點才發現」。
-const VALUE_FLAGS = new Set(['url', 'key', 'model', 'aspect', 'size', 'out', 'label', 'seconds', 'ref', 'answer']);
-const REPEATABLE = new Set(['ref']); // 可重複給的旗標 → 收成陣列（多張參考圖）
+const VALUE_FLAGS = new Set(['url', 'key', 'model', 'aspect', 'size', 'out', 'label', 'seconds', 'ref', 'answer', 'fit', 'audio', 'mix']);
+const REPEATABLE = new Set(['ref', 'video', 'audio']); // 可重複給的旗標 → 收成陣列（多張參考圖、多段影片、聲音）
 const BOOL_FLAGS = new Set(['yes', 'video', 'help', 'h']);
-function parse(argv) {
+// --video 一個名字兩種意思：generate 的 --video 是「生成影片」（布林），tool 的 --video <檔案> 是要處理的影片（可重複）。
+// 照指令分開解析，不另取新名字：tool 的圖叫 --ref、影片叫 --video，跟 MCP 的 images／videos 對得上，最好記。
+function parse(argv, cmd) {
   const pos = [];
   const flags = {};
+  const takesValue = (k) => VALUE_FLAGS.has(k) || (cmd === 'tool' && k === 'video');
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith('--') || (a.startsWith('-') && a.length === 2 && !/^-\d/.test(a))) {
       const k = a.replace(/^--?/, '');
-      if (VALUE_FLAGS.has(k)) {
+      if (takesValue(k)) {
         const nxt = argv[i + 1];
         if (nxt === undefined || nxt.startsWith('--')) fail(`旗標 --${k} 需要一個值。`); // 早退，避免扣點後才失敗
         if (REPEATABLE.has(k)) (flags[k] ??= []).push(nxt);
@@ -88,15 +91,43 @@ function readRefs(flags) {
   });
 }
 
+// tool 的 --video：本機影片 → data URL（大小上限與理由見 lib/refs.mjs）；Banaverse 回傳的網址、data URL 原樣送。
+function readVideos(flags) {
+  const list = Array.isArray(flags.video) ? flags.video : [];
+  return list.map((r) => {
+    if (isRemote(r)) return r;
+    let data;
+    try { data = localVideo(r); } catch (e) { fail(e.message); }
+    if (!data) fail(`找不到影片檔：${r}`);
+    return data;
+  });
+}
+
+// tool 的 --audio：配上聲音要放進影片的聲音（本機檔案 → data URL）。
+function readAudios(flags) {
+  const list = Array.isArray(flags.audio) ? flags.audio : [];
+  return list.map((r) => {
+    if (isRemote(r)) return r;
+    let data;
+    try { data = localAudio(r); } catch (e) { fail(e.message); }
+    if (!data) fail(`找不到聲音檔：${r}`);
+    return data;
+  });
+}
+
 // ── http ────────────────────────────────────────────────────────────────
 // hint：失敗時接在錯誤訊息後面的一句。取件時用來把 jobId 交回給使用者——
 // 輪詢中途一個暫時性的 5xx 就讓程式結束，而使用者手上沒有取件代號的話，只剩「重跑 generate」一條路，那會再扣一次點。
 async function api(path, { method = 'GET', body, url, key, hint = '', _retried = false } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (key) headers.Authorization = `Bearer ${key}`;
+  const json = body ? JSON.stringify(body) : undefined;
+  // 太大的先擋：Cloud Run 會直接回 413、連錯誤原因都沒有（上限與理由見 lib/refs.mjs）。
+  const big = json && bodyTooBig(json);
+  if (big) fail(big);
   let res;
   try {
-    res = await fetch(url + path, { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) });
+    res = await fetch(url + path, { method, headers, ...(json ? { body: json } : {}) });
   } catch (e) {
     fail(`連不到 ${url}${path}（${e.message}）。檢查網路，或用 --url 指定站台。${hint}`);
   }
@@ -308,9 +339,14 @@ async function cmdGenerate(pos, flags) {
 // 為什麼（2026-11-11）：agent 自己寫試穿、白背景的 prompt，好壞看它的功力、每次還不一樣；
 // 工具是調過的那一份，誰叫都拿到一樣的成品，agent 也不必花 token 寫 prompt。
 
-/** 一行講清楚要給什麼：幾張圖（每張是什麼）、--answer 填什麼、出圖還是出影片。 */
+/** 吃影片的工具（影片去背、接成一支、轉比例）：伺服器的型錄會多一個 videos，圖給 0 張。 */
+const needsOf = (t) => (t.videos ? { ...t.videos, unit: '段影片', flag: '--video' } : { ...t.images, unit: '張圖', flag: '--ref' });
+const countOf = (n) => (n.min === n.max ? `${n.min}` : `${n.min}–${n.max}`);
+
+/** 一行講清楚要給什麼：幾張圖或幾段影片（每張是什麼）、--answer 填什麼、出圖還是出影片。 */
 function toolNeeds(t) {
-  const n = t.images.min === t.images.max ? `${t.images.min} 張圖` : `${t.images.min}–${t.images.max} 張圖`;
+  const need = needsOf(t);
+  const n = `${countOf(need)} ${need.unit}${t.audios ? `＋${countOf(t.audios)} 段聲音` : ''}`;
   const slots = t.slots ? `：${t.slots.join('、')}` : '';
   const opts = t.ask?.kind === 'pick' ? t.ask.options.map((o) => o.id) : [];
   const ask = !t.ask ? '' : t.ask.kind === 'pick'
@@ -323,8 +359,14 @@ function toolNeeds(t) {
 function toolDetail(t) {
   const lines = [`${t.id}「${t.label}」：${t.hint}`, `  要給：${toolNeeds(t)}`];
   if (t.ask?.kind === 'pick') lines.push(`  ${t.ask.question}可填：${t.ask.options.map((o) => o.id).join('、')}（不給＝${t.ask.defaults.join('、')}）`);
-  const refs = t.slots ? t.slots.map((s) => ` --ref ${s}.jpg`).join('') : ' --ref 圖.jpg'.repeat(t.images.min);
-  lines.push(`  例：banaverse tool ${t.id}${refs}${t.ask?.kind === 'text' && t.ask.required ? ' --answer "…"' : ''}`);
+  const refs = t.videos
+    ? Array.from({ length: t.videos.min }, (_, i) => ` --video 片段${t.videos.min > 1 ? i + 1 : ''}.mp4`).join('')
+    : t.slots ? t.slots.map((s) => ` --ref ${s}.jpg`).join('') : ' --ref 圖.jpg'.repeat(t.images.min);
+  // 上字幕的回答是好幾行的字幕：例子直接寫成讀檔的樣子。
+  const answer = t.id === 'subtitle' ? ' --answer @字幕.txt' : t.ask?.kind === 'text' && t.ask.required ? ' --answer "…"' : '';
+  lines.push(`  例：banaverse tool ${t.id}${refs}${t.audios ? ' --audio 聲音.mp3' : ''}${answer}`);
+  if (t.id === 'dub') lines.push('  --mix replace（換掉原音，預設）／music（當背景音樂）／voice（當旁白）');
+  if (t.id === 'subtitle') lines.push('  字幕一行一句、開頭寫時間，例：0:00-0:03 大家好');
   return lines.join('\n');
 }
 
@@ -339,7 +381,9 @@ async function cmdTools(flags) {
     for (const t of list) console.log(`  ${t.id.padEnd(idW)}${t.label}　${t.hint}（${toolNeeds(t)}）`);
     console.log('');
   }
-  console.log('用法：banaverse tool <代號> --ref <圖> [--ref <圖>] [--answer "…"]\n例：  banaverse tool tryon --ref 人物.jpg --ref 衣服.jpg');
+  console.log('用法：banaverse tool <代號> --ref <圖> [--ref <圖>] [--answer "…"]（吃影片的工具改給 --video <影片>）\n'
+    + '例：  banaverse tool tryon --ref 人物.jpg --ref 衣服.jpg\n'
+    + '      banaverse tool join --video 第一段.mp4 --video 第二段.mp4');
 }
 
 /** --answer 整理成伺服器要的樣子（規則同伺服器的 toolAnswer）：選項題不給就用預設；文字題必填的沒給就擋。 */
@@ -354,8 +398,8 @@ function toolAnswer(t, raw) {
     if (!picked.length) fail(`「${t.label}」的 --answer 只能填：${ask.options.map((o) => o.id).join('、')}`);
     return ask.single ? [picked[0]] : [...new Set(picked)];
   }
-  const text = String(raw ?? '').trim();
-  if (!text && ask.required) fail(`「${t.label}」要先回答：${ask.question}（加 --answer "…"）\n${toolDetail(t)}`);
+  const text = answerText(raw).trim();
+  if (!text && ask.required) fail(`「${t.label}」要先回答：${ask.question}（加 --answer "…"，好幾行的用 --answer @檔案.txt）\n${toolDetail(t)}`);
   return [text];
 }
 
@@ -369,13 +413,24 @@ async function cmdTool(pos, flags) {
   const [{ tools }, catalog] = await Promise.all([api('/api/v1/tools', { url }), api('/api/v1/models', { url, key })]);
   const t = tools.find((x) => x.id === id);
   if (!t) fail(`沒有「${id}」這個工具。工具清單：banaverse tools`);
-  // 圖、答案、模型都先驗過，才問要不要花點數：不會確認完、扣了點才發現少一張圖。
-  const refs = readRefs(flags);
-  if (refs.length < t.images.min || refs.length > t.images.max) {
-    const n = t.images.min === t.images.max ? `${t.images.min}` : `${t.images.min}–${t.images.max}`;
-    fail(`「${t.label}」要 ${n} 張圖${t.slots ? `（照順序：${t.slots.join('、')}）` : ''}，這次給了 ${refs.length} 張。\n${toolDetail(t)}`);
+  // 圖、影片、答案、模型都先驗過，才問要不要花點數：不會確認完、扣了點才發現少一張圖。
+  const need = needsOf(t);
+  const other = t.videos ? (flags.ref?.length ? '--ref' : '') : (flags.video?.length ? '--video' : '');
+  if (other) fail(`「${t.label}」吃的是${t.videos ? '影片，請用 --video' : '圖，請用 --ref'}（不是 ${other}）。\n${toolDetail(t)}`);
+  const inputs = t.videos ? readVideos(flags) : readRefs(flags);
+  const audios = readAudios(flags);
+  if (audios.length && !t.audios) fail(`「${t.label}」不吃聲音（--audio）。\n${toolDetail(t)}`);
+  if (t.audios && (audios.length < t.audios.min || audios.length > t.audios.max)) fail(`「${t.label}」要 ${countOf(t.audios)} 段聲音（--audio），這次給了 ${audios.length} 段。\n${toolDetail(t)}`);
+  if (inputs.length < need.min || inputs.length > need.max) {
+    fail(`「${t.label}」要 ${countOf(need)} ${need.unit}${t.slots ? `（照順序：${t.slots.join('、')}）` : ''}，這次給了 ${inputs.length} ${t.videos ? '段' : '張'}。\n${toolDetail(t)}`);
   }
   const answer = toolAnswer(t, flags.answer);
+
+  // 機台上的處理工具（去背、影片去背、接成一支、轉比例）：模型不在公開的模型清單裡，也不是固定一顆——
+  // 使用者的公司有自己的機台就用本地版（不扣點），否則用 Banaverse 那台（照價扣點），由伺服器挑。
+  // 所以不報價、也不代挑模型：代挑會挑到清單第一個的本地版，沒有機台的帳號就被擋。
+  const engine = !t.models.some((id) => catalog.models.some((m) => m.id === id));
+  if (engine) return runEngineTool({ url, key, t, flags, inputs, audios, answer });
 
   // 模型：指定就用（要同一類）；沒指定就照工具排的順序，挑第一顆這個帳號開通了的——跟伺服器挑的一樣，報價才對得上。
   let info;
@@ -396,24 +451,54 @@ async function cmdTool(pos, flags) {
   const cost = isVideo
     ? `${versions > 1 ? `${versions} 版，` : ''}每版基準售價 ${each} 點（實扣依秒數與解析度；送出後會印出實扣）`
     : `將花 ${each * versions} 點${versions > 1 ? `（${versions} 版，每版 ${each} 點）` : ''}`;
-  if (!flags.yes && !info.free) {
-    const q = `用「${t.label}」（${info.label}）處理 ${refs.length} 張圖，${cost}。`;
-    if (stdin.isTTY && stdout.isTTY) {
-      const a = await ask(`${q}繼續？[y/N] `);
-      if (!/^y(es)?$/i.test(a)) { console.log('已取消。'); return; }
-    } else {
-      fail(`${q}確認後加 --yes 再跑（或先 banaverse models 看價格）。`);
-    }
-  }
+  if (!flags.yes && !info.free && !(await confirmSpend(`用「${t.label}」（${info.label}）處理 ${inputs.length} 張圖，${cost}。`))) return;
 
   process.stderr.write(`⏳ ${t.label}中（${info.label}${versions > 1 ? `，${versions} 版` : ''}）…\n`);
-  const r = await api('/api/v1/tools', {
-    method: 'POST', url, key,
+  return runToolSteps({
+    url, key, t, flags,
     body: {
-      tool: t.id, answer, images: refs, model: info.id, aspectRatio: flags.aspect, imageSize: flags.size,
+      tool: t.id, answer, images: inputs, model: info.id, aspectRatio: flags.aspect, imageSize: flags.size,
       durationSec: flags.seconds ? Number(flags.seconds) : undefined,
     },
   });
+}
+
+/** 機台上的處理工具：素材照工具吃的種類放 images 或 videos；模型只在使用者指名時才送（理由見 cmdTool）。 */
+async function runEngineTool({ url, key, t, flags, inputs, audios, answer }) {
+  if (flags.model && !t.models.includes(flags.model)) fail(`「${t.label}」的 --model 只能填：${t.models.join('、')}（不給＝伺服器挑：有自己的機台就用自己的）。`);
+  if (flags.fit && !['blur', 'crop'].includes(flags.fit)) fail('--fit 只能填 blur（完整保留，空的地方用模糊的同一段影片補滿）或 crop（從中間裁切填滿）。');
+  if (flags.mix && !['replace', 'music', 'voice'].includes(flags.mix)) fail('--mix 只能填 replace（換掉原音）、music（當背景音樂）或 voice（當旁白）。');
+  // 影片去背按秒計價：--seconds 沒給、影片是本機 mp4／mov，就照檔案讀出來的長度填（給網址時沒填，照 5 秒算，比填的長會被退回並告訴你實際秒數）。
+  const sec = flags.seconds ? Number(flags.seconds) : t.id === 'videocutout' ? mp4Seconds(inputs[0]) : null;
+  const what = (t.videos ? `${inputs.length} 段影片` : `${inputs.length} 張圖`) + (audios.length ? `＋${audios.length} 段聲音` : '');
+  const q = `用「${t.label}」處理 ${what}：在 Banaverse 機台上做，貴公司有自己的機台就不扣點，否則照價扣點（送出後會印出實扣）。`;
+  if (!flags.yes && !(await confirmSpend(q, ''))) return;
+  process.stderr.write(`⏳ ${t.label}中…\n`);
+  return runToolSteps({
+    url, key, t, flags,
+    body: {
+      tool: t.id, answer, ...(t.videos ? { videos: inputs } : { images: inputs }), ...(audios.length ? { audios } : {}),
+      model: flags.model, aspectRatio: flags.aspect, fit: flags.fit, audioMix: flags.mix,
+      ...(sec ? { durationSec: Math.ceil(sec - 1e-6) } : {}),
+    },
+  });
+}
+
+/** 要花點數的動作先問一聲；不是終端機（agent 在跑）就請它確認後加 --yes。回 false＝使用者取消。 */
+async function confirmSpend(q, hint = '（或先 banaverse models 看價格）') {
+  if (stdin.isTTY && stdout.isTTY) {
+    const a = await ask(`${q}繼續？[y/N] `);
+    if (/^y(es)?$/i.test(a)) return true;
+    console.log('已取消。');
+    return false;
+  }
+  fail(`${q}確認後加 --yes 再跑${hint}。`);
+}
+
+/** 送出工具、逐版取件存檔。影片與排隊中的圖片會在這裡等到完成。 */
+async function runToolSteps({ url, key, t, flags, body }) {
+  const isVideo = t.out === 'video';
+  const r = await api('/api/v1/tools', { method: 'POST', url, key, body });
   let saved = 0;
   const base = `banaverse-${t.id}-${stamp()}`;
   for (const [i, s] of r.steps.entries()) {
@@ -422,7 +507,7 @@ async function cmdTool(pos, flags) {
     let res = s;
     // 影片、排隊太久的自有機台圖片：點已扣、工單在跑，在這裡接著取件——不要重跑 tool，那會再扣一次。
     if (s.async) {
-      process.stderr.write(`⏳ ${name || t.label}${isVideo ? '影片生成中，通常 1–5 分鐘' : '機台排隊中'}（${s.credits ? `已扣 ${s.credits} 點` : '未扣點'}）。中途離開可用這個 jobId 取回：\n   ${s.jobId}\n`);
+      process.stderr.write(`⏳ ${name || t.label}${isVideo ? '影片製作中，通常 1–5 分鐘' : '機台排隊中'}（${s.credits ? `已扣 ${s.credits} 點` : '未扣點'}）。中途離開可用這個 jobId 取回：\n   ${s.jobId}\n`);
       const j = await waitJob({ url, key, jobId: s.jobId, everyMs: isVideo ? 10000 : 5000 });
       if (!j) continue;
       res = { ...j, credits: j.credits ?? s.credits };
@@ -540,8 +625,9 @@ const HELP = `banaverse — Banaverse 生成 CLI（文字生成圖片／影片�
   banaverse whoami                                  帳號與點數餘額
   banaverse models                                  可用模型與即時售價（圖片／影片／音訊／3D）
   banaverse generate "<提示>" [選項]                 生成圖片（加 --video 生成影片；加 --ref 用參考圖）
-  banaverse tools                                   工具清單（白背景、換背景、試穿、多尺寸、換畫風…）
+  banaverse tools                                   工具清單（白背景、試穿、去背、多尺寸、接影片、轉比例…）
   banaverse tool <代號> --ref <圖> [--answer "…"]    用工具處理圖片（prompt 與模型是調好的，只要給圖）
+  banaverse tool <代號> --video <影片> …             用工具處理影片（影片去背、接成一支、轉比例）
   banaverse job <jobId> [--out <檔名>]              取回先前送出的影片、排隊中的圖片或 3D
   banaverse logout                                  清除本機設定
 
@@ -566,9 +652,15 @@ https://banaverse.thepocket.company/api-docs 的「模型參考」。
 
 tool 選項：
   --ref <檔案>     要處理的圖，照工具要的順序（例：試穿＝先人物、再衣服）。張數見 banaverse tools。
+  --video <影片>   吃影片的工具要處理的影片，照順序；接成一支給 2–10 段（--video a.mp4 --video b.mp4）。
+                   吃本機檔案（mp4/mov/webm/m4v）或 Banaverse 回傳過的影片網址。本機檔案一次合計
+                   約 23 MB 以內（雲端單次請求上限 32 MB），大檔請改給 Banaverse 網址。
   --answer "…"     工具要問的那一題（換背景＝換成什麼、多尺寸＝1:1、9:16）。選項題不給就用預設。
-  --model／--aspect／--size／--seconds／--out／--yes  同 generate。好幾版的工具（多尺寸、系列圖）
+  --aspect <比例>  只出一版的工具才有效。轉比例：9:16（預設）／16:9／1:1。
+  --fit <方式>     轉比例專用：blur＝完整保留、空的地方用模糊的同一段影片補滿（預設）；crop＝從中間裁切填滿。
+  --model／--size／--seconds／--out／--yes  同 generate。好幾版的工具（多尺寸、系列圖）
                    每一版各扣一次點、各存一個檔（檔名帶上那一版的名字）。
+  去背、影片去背、接成一支、轉比例在 Banaverse 機台上做：貴公司有自己的機台就不扣點，否則照價扣點。
 
 影片需 1–5 分鐘。中途 Ctrl+C 離開後，可用印出來的 jobId 跑 banaverse job <jobId> 取回；
 不要重跑 generate，那會再扣一次點。音訊與 3D 不在 CLI，請用 MCP（banaverse-mcp）或 API。
@@ -579,8 +671,8 @@ tool 選項：
 async function main() {
   let argv = process.argv.slice(2);
   if (argv[0] === 'auth') argv = argv.slice(1); // 支援 "banaverse auth login"
-  const { pos, flags } = parse(argv.slice(1));
   const cmd = argv[0];
+  const { pos, flags } = parse(argv.slice(1), cmd);
   if (flags.help || flags.h) { console.log(HELP); return; } // `banaverse generate --help` 也要能看說明
   switch (cmd) {
     case 'login': return cmdLogin(flags);
